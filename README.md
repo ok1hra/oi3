@@ -1,4 +1,6 @@
-# OI3 — Firmware Manual
+# Open Interface III
+
+![Open Interface III](oi3.png)
 
 Firmware for **Open Interface III** — a station interface between PC and an
 Icom-family transceiver (CAT, PTT/sequencer, CW/RTTY/FSK keying, optional
@@ -10,6 +12,41 @@ means.
 > schematics, jumpers, per-rig connector diagrams), see
 > [doc/open-interface-iii.md](doc/open-interface-iii.md) — linked again at
 > the bottom of this document.
+
+## Contents
+
+- [First boot](#first-boot)
+- [Display](#display)
+  - [Row 0 — menu / value / mode](#row-0--menu--value--mode)
+  - [Row 1 — keyer TX echo + transient overlays](#row-1--keyer-tx-echo--transient-overlays)
+- [Buttons](#buttons)
+  - [Auto-repeat](#auto-repeat)
+  - [Tones](#tones)
+- [Menu navigation (FSM)](#menu-navigation-fsm)
+  - [MODE button](#mode-button)
+- [Menu items](#menu-items)
+- [CI-V (Icom CAT)](#ci-v-icom-cat)
+  - [CW over CI-V (CIV_CW_VIA_CIV)](#cw-over-ci-v-civ_cw_via_civ)
+- [PTT, sequencer and interlock](#ptt-sequencer-and-interlock)
+  - [Outputs](#outputs)
+  - [Mode → output mapping](#mode--output-mapping)
+  - [Sequencer timing](#sequencer-timing)
+  - [Inputs](#inputs)
+  - [InterlockEnable=1 (safety mode)](#interlockenable1-safety-mode)
+  - [InterlockEnable=0 (PTT-in mode)](#interlockenable0-ptt-in-mode)
+- [Keyer (K3NG-derived, CW + RTTY/FSK)](#keyer-k3ng-derived-cw--rttyfsk)
+  - [Paddle behaviour](#paddle-behaviour)
+  - [PTT timing](#ptt-timing)
+  - [CW decoder (paddle → LCD row 1)](#cw-decoder-paddle--lcd-row-1)
+  - [TrxNet remote CW](#trxnet-remote-cw)
+  - [RTTY / FSK output](#rtty--fsk-output)
+  - [Persistence](#persistence)
+- [TrxNet (peer-to-peer LAN)](#trxnet-peer-to-peer-lan)
+- [Ethernet](#ethernet)
+- [SD card and `oi3.cfg`](#sd-card-and-oi3cfg)
+- [EEPROM map](#eeprom-map)
+- [Build / flash](#build--flash)
+- [Hardware reference](#hardware-reference)
 
 ---
 
