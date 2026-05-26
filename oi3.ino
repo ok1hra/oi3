@@ -1,4 +1,4 @@
-const char* REV = "20260524";
+const char* REV = "20260526";
 
 const int DCIN PROGMEM = A7;      // measure input voltage
 const int DC3V PROGMEM = A6;      // measure 3,3V
@@ -53,6 +53,12 @@ const int SMTpad1 PROGMEM = 48;   // ^ Internal SMT pad
 const int SMTpad2 PROGMEM = 49;   // -
 const int SMTpad3 PROGMEM = A0;   // v
 
+
+// Operational serial output gate. OFF (default) suppresses periodic runtime
+// chatter ([CIV freq/mode/watchdog], [PTT ...], [Interlock=...]); init banners,
+// errors, settings echo and Ethernet link-state changes always print.
+// Toggled via LCD menu item 15 (Debug on/off); not persisted in EEPROM.
+static bool serialDebug = false;
 
 
 // ===================== LCD =====================
@@ -548,7 +554,7 @@ void civ_loop() {
       CivValid = true;
       if (wasInvalid || f != CivFreq) {
         CivFreq = f;
-        Serial.print(F("[CIV freq=")); Serial.print(CivFreq); Serial.println(']');
+        if (serialDebug) { Serial.print(F("[CIV freq=")); Serial.print(CivFreq); Serial.println(']'); }
         civ_publish_freq();
       }
       // chain mode request after a freq response (k3ng pattern)
@@ -562,10 +568,12 @@ void civ_loop() {
       civRd[4] = 0;
       if (m != CivMode) {
         CivMode = m;
-        Serial.print(F("[CIV mode="));
-        if (m < 0x10) Serial.print('0');
-        Serial.print(m, HEX);
-        Serial.println(']');
+        if (serialDebug) {
+          Serial.print(F("[CIV mode="));
+          if (m < 0x10) Serial.print('0');
+          Serial.print(m, HEX);
+          Serial.println(']');
+        }
         civ_publish_mode();
       }
     }
@@ -574,7 +582,7 @@ void civ_loop() {
   // watchdog
   if (CivValid && (millis() - civLastParseMs) > CIV_WATCHDOG_MS) {
     CivValid = false;
-    Serial.println(F("[CIV watchdog: no data]"));
+    if (serialDebug) Serial.println(F("[CIV watchdog: no data]"));
   }
 }
 // =================== END ICOM CI-V ===================
@@ -765,7 +773,7 @@ static void ptt_sequencer_step() {
         digitalWrite(SEQUENCER, HIGH);
         LastSeqChange = now;
         SequencerLevel = 5;
-        Serial.println(F("[PTT SEQ-H]"));
+        if (serialDebug) Serial.println(F("[PTT SEQ-H]"));
       }
       break;
     case 5:  // SEQ up — wait SEQUENCERlead, then PA up; or on release wait SEQUENCERtail then SEQ down
@@ -773,12 +781,12 @@ static void ptt_sequencer_step() {
         digitalWrite(PTTPA, HIGH);
         LastSeqChange = now;
         SequencerLevel = 4;
-        Serial.println(F("[PTT PA-H]"));
+        if (serialDebug) Serial.println(F("[PTT PA-H]"));
       } else if (!PttActive && (now - LastSeqChange) >= (unsigned long)SEQUENCERtail) {
         digitalWrite(SEQUENCER, LOW);
         LastSeqChange = now;
         SequencerLevel = 0;
-        Serial.println(F("[PTT SEQ-L]"));
+        if (serialDebug) Serial.println(F("[PTT SEQ-L]"));
       }
       break;
     case 4:  // PA up — wait PAlead then PTT123 up (skipped if pttExternal); or on release wait PAtail then PA down
@@ -786,12 +794,12 @@ static void ptt_sequencer_step() {
         digitalWrite(PTT_PINS[PttOut], HIGH);
         LastSeqChange = now;
         SequencerLevel = PttOut;
-        Serial.print(F("[PTT")); Serial.print(PttOut); Serial.println(F("-H]"));
+        if (serialDebug) { Serial.print(F("[PTT")); Serial.print(PttOut); Serial.println(F("-H]")); }
       } else if (!PttActive && (now - LastSeqChange) >= (unsigned long)PAtail) {
         digitalWrite(PTTPA, LOW);
         LastSeqChange = now;
         SequencerLevel = 5;
-        Serial.println(F("[PTT PA-L]"));
+        if (serialDebug) Serial.println(F("[PTT PA-L]"));
       }
       break;
     case 1:
@@ -800,7 +808,7 @@ static void ptt_sequencer_step() {
       if (!PttActive && (now - LastSeqChange) >= (unsigned long)PTTtail) {
         digitalWrite(PTT_PINS[SequencerLevel], LOW);
         LastSeqChange = now;
-        Serial.print(F("[PTT")); Serial.print(SequencerLevel); Serial.println(F("-L]"));
+        if (serialDebug) { Serial.print(F("[PTT")); Serial.print(SequencerLevel); Serial.println(F("-L]")); }
         SequencerLevel = 4;
       } else if (PttActive) {
         // PTT continues — refresh LastSeqChange so next tail starts only on release
@@ -835,9 +843,11 @@ static void ptt_inputs_poll() {
       // safety interlock from PA: edge → toggle abort flag
       ptt_interlock_active ^= 1;
       pttExternal = false;
-      Serial.print(F("[Interlock="));
-      Serial.print(ptt_interlock_active);
-      Serial.println(']');
+      if (serialDebug) {
+        Serial.print(F("[Interlock="));
+        Serial.print(ptt_interlock_active);
+        Serial.println(']');
+      }
     } else {
       // PTT-in: LOW = TX; pttExternal skips PTT123 in sequencer
       bool ilTx = (interlockNow == LOW);
@@ -974,6 +984,10 @@ static bool          keyerEepromDirty   = false;
 
 // --- LCD row-1 TX text cursor (wrap mode) ---
 static uint8_t       keyerLcdTxCol      = 0;
+// When true, keyer_lcd_putc drops chars from LCD (TX still happens on the air).
+// Set by LCD RUNTIME during a WPM-change overlay so transient chars don't
+// overwrite the "WPM 28" notification on row 1.
+static bool          keyerRow1Locked    = false;
 
 // --- TrxNet /s-cw drop-box (filled by onSetCw callback, drained in loop) ---
 static char          trxPendingCW[KEYER_SENDBUF_SIZE];
@@ -1001,6 +1015,7 @@ void onSetCw(const char* /*from*/, const uint8_t* data, size_t len) {
 // Called after each element/char has actually been transmitted, so the LCD
 // is a truthful log of what went on the air.
 static void keyer_lcd_putc(char c) {
+  if (keyerRow1Locked) return;   // LCD overlay owns row 1 briefly
   // Space at end of row gets eaten — no wrap on whitespace
   if (c == ' ' && keyerLcdTxCol >= 16) return;
   if (keyerLcdTxCol >= 16) {
@@ -1206,6 +1221,24 @@ static void keyer_wait_us_pump(unsigned long us) {
   }
 }
 
+// Variant of wait_us_pump that does NOT scan paddles — used as a quiet window
+// at the start of the inter-element gap. PCB has bypass capacitors on paddle
+// lines (~100 nF); after a release the cap charges through the internal
+// pull-up over a few ms. Without this window, the MCU sees LOW during cap
+// recovery and latches a spurious buffer, producing extra dits/dahs (single
+// 'E' comes out as 'I' etc.).
+static void keyer_wait_us_no_scan(unsigned long us) {
+  unsigned long start = micros();
+  while ((micros() - start) < us) {
+    ethernet_loop();
+    trxnet_loop();
+    civ_loop();
+    ptt_loop();
+    if (trxCwAbort) break;
+  }
+}
+const unsigned long KEYER_CAP_QUIET_MS = 5;   // paddle-blind window at element end
+
 // ----- Sequencer gate: request PTT, then block until SequencerLevel == PttOut -----
 // This is the "WAITING_FOR_SEQUENCER" state from the design: first element
 // (sidetone + key) only fires once the sequencer has brought up SEQ + PA + PTT123.
@@ -1248,9 +1281,16 @@ static void keyer_emit_element(byte type, bool keyHw) {
   }
   if (KeyerSidetoneNow != 0) noTone(TONE);
 
-  // Inter-element gap (1 dit time of silence)
+  // Inter-element gap (1 dit time of silence). First KEYER_CAP_QUIET_MS is
+  // paddle-blind to skip the bypass-cap recovery window — without it a clean
+  // single dit release at element end gets latched as a second dit by the
+  // cap's slow rise through the logic threshold (single 'E' → 'I').
   keyerBeingSent = 0;
-  keyer_wait_us_pump(dit_ms * 1000UL);
+  unsigned long inter_us = dit_ms * 1000UL;
+  unsigned long quiet_us = KEYER_CAP_QUIET_MS * 1000UL;
+  if (quiet_us > inter_us) quiet_us = inter_us;
+  keyer_wait_us_no_scan(quiet_us);
+  keyer_wait_us_pump(inter_us - quiet_us);
 
   // Accumulate into paddle decoder only for live paddle elements
   if (keyerSendingMode == KEYS_MANUAL) {
@@ -1525,6 +1565,12 @@ void keyer_setup() {
   pinMode(CW2, OUTPUT); digitalWrite(CW2, LOW);
   keyer_eeprom_load();
   keyer_fsk_release();   // pinMode INPUT — high-Z; external pull network sets the line
+  // OI3 hardware has bypass capacitors on PADDLEL/PADDLER lines. After pinMode
+  // INPUT_PULLUP the caps need ~tens of ms to charge through the internal
+  // pull-up; until then the MCU reads LOW = "paddle pressed" and would
+  // generate spurious dits/dahs. K3NG firmware uses delay(250) here for the
+  // same reason (k3ng_keyer.ino:8618).
+  delay(250);
 
   keyerState     = KEYER_IDLE;
   keyerSendHead  = keyerSendTail = 0;
@@ -1578,7 +1624,8 @@ void keyer_loop() {
 //   short press in EDITING  → BROWSING with save (tone 600 Hz, write EEPROM)
 //   long press  in EDITING  → BROWSING with cancel (tone 200 Hz, restore pre-value)
 // Menu items 0..8: read-only (call/FW/IP/baud/CIV/freq/peers/PTT).
-// Menu items 9..13: editable keyer settings (WPM/Mode/Pad/Sidetone/Bd).
+// Menu items 9..14: editable keyer settings (WPM/Mode/Pad/Sidetone/Bd/FSK).
+// Menu item 15:    editable serial debug toggle (not persisted).
 // PINNED WPM ±: M1/M2 with auto-repeat (500 ms hold → 5/s repeat). M1 = down,
 // M2 = up. Each fires keyer_set_wpm() which marks the keyer EEPROM dirty for
 // debounced flush.
@@ -1593,7 +1640,7 @@ void keyer_loop() {
 // (see KEYER block) — saved by lcd_edit_save().
 #include <EEPROM.h>
 
-const uint8_t LCD_MENU_ITEM_COUNT = 15;
+const uint8_t LCD_MENU_ITEM_COUNT = 16;
 const uint8_t LCD_VALUE_WIDTH     = 12;
 const uint8_t LCD_MODE_WIDTH      = 3;
 const uint8_t LCD_SEP_COL         = 12;
@@ -1604,6 +1651,7 @@ const unsigned long LCD_TICK_MS              = 30;
 const unsigned long LCD_MODE_HOLD_MS         = 800;
 const unsigned long LCD_BTN_REPEAT_DELAY_MS  = 500;   // hold this long → start repeating
 const unsigned long LCD_BTN_REPEAT_RATE_MS   = 200;   // 5 Hz repeat
+const unsigned long LCD_ROW1_OVERLAY_MS      = 800;   // WPM overlay duration on row 1
 const int           LCD_M1_MAX       = 5;     // M1:  tmp < 5
 const int           LCD_SET_MIN      = 45;    // SET: 45 < tmp < 130
 const int           LCD_SET_MAX      = 130;
@@ -1624,6 +1672,7 @@ static uint8_t       lcdBtnPrev      = 0;  // 0=none, 1=M1, 2=SET, 3=M2
 static unsigned long lcdBtnPressMs   = 0;
 static unsigned long lcdBtnRepeatNextMs = 0;
 static int32_t       lcdEditPreValue = 0;  // pre-edit snapshot for cancel/restore
+static unsigned long lcdRow1OverlayUntilMs = 0;  // 0 = no overlay active
 
 static uint8_t lcd_read_button() {
   int tmp = analogRead(MEM);
@@ -1719,6 +1768,9 @@ static void lcd_format_value(uint8_t idx, char* out) {
     case 14:  // KEYER FSK polarity
       snprintf(raw, sizeof(raw), "FSK %c", KeyerFskReverseNow ? 'R' : 'N');
       break;
+    case 15:  // serial debug toggle (not persisted)
+      strcpy(raw, serialDebug ? "Debug on" : "Debug off");
+      break;
     default:
       strcpy(raw, "?");
       break;
@@ -1787,10 +1839,26 @@ void lcd_runtime_init() {
   lcdLastTickMs = millis();
 }
 
+// ----- Row-1 overlay (transient WPM display during PINNED M1/M2 edit) -----
+// Briefly overrides KEYER's row-1 TX text with "WPM NN" so the operator gets
+// immediate visual feedback when changing speed with the panel buttons.
+// During the overlay window, keyer_lcd_putc drops chars from the LCD (TX
+// stays on the air); on expiry, row 1 is cleared and KEYER's cursor reset.
+static void lcd_row1_overlay_wpm() {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "WPM %u", KeyerWpm);
+  keyerRow1Locked = true;
+  lcd.setCursor(0, 1);
+  lcd.print(F("                "));
+  lcd.setCursor(0, 1);
+  lcd.print(buf);
+  lcdRow1OverlayUntilMs = millis() + LCD_ROW1_OVERLAY_MS;
+}
+
 // ----- Editable-item helpers (items 9..13) -----
 
 static bool lcd_item_is_editable(uint8_t idx) {
-  return idx >= 9 && idx <= 14;
+  return idx >= 9 && idx <= 15;
 }
 
 static int32_t lcd_item_get_value(uint8_t idx) {
@@ -1801,6 +1869,7 @@ static int32_t lcd_item_get_value(uint8_t idx) {
     case 12: return (int32_t)KeyerSidetoneNow;
     case 13: return (int32_t)KeyerRttyBaudNow;
     case 14: return KeyerFskReverseNow ? 1 : 0;
+    case 15: return serialDebug ? 1 : 0;
     default: return 0;
   }
 }
@@ -1819,6 +1888,7 @@ static void lcd_item_set_value(uint8_t idx, int32_t v) {
              // line stays released (high-Z) at idle regardless of polarity.
              keyer_fsk_release();
              break;
+    case 15: serialDebug = (v != 0); break;
   }
 }
 
@@ -1864,6 +1934,9 @@ static void lcd_edit_step(int delta) {
       KeyerFskReverseNow = !KeyerFskReverseNow;
       keyer_fsk_release();   // ensure line is released (polarity only affects TX bits)
       break;
+    case 15:  // Serial debug on ↔ off toggle
+      serialDebug = !serialDebug;
+      break;
   }
 }
 
@@ -1879,6 +1952,11 @@ static void lcd_edit_save() {
              break;
     case 13: EEPROM.update(KEYER_EEPROM_RTTYBAUD_ADDR, KeyerRttyBaudNow); break;
     case 14: EEPROM.update(KEYER_EEPROM_FSKREV_ADDR,   KeyerFskReverseNow ? 1 : 0); break;
+    case 15: // serial debug not persisted; announce state-change unconditionally
+             Serial.print(F("[Debug "));
+             Serial.print(serialDebug ? F("ON") : F("OFF"));
+             Serial.println(']');
+             break;
   }
 }
 
@@ -1918,7 +1996,10 @@ void lcd_loop() {
   if (lcdState == LCD_PINNED && (isEdge || isRepeat)) {
     if (btnNow == 1)      keyer_set_wpm((KeyerWpm > 5)  ? KeyerWpm - 1 : 5);
     else if (btnNow == 3) keyer_set_wpm((KeyerWpm < 50) ? KeyerWpm + 1 : 50);
-    if (isEdge && (btnNow == 1 || btnNow == 3)) tone(TONE, 600, 30);
+    if (btnNow == 1 || btnNow == 3) {
+      lcd_row1_overlay_wpm();   // refresh overlay each step (extends timer)
+      if (isEdge) tone(TONE, 600, 30);
+    }
   }
 
   lcdBtnPrev = btnNow;
@@ -1959,6 +2040,15 @@ void lcd_loop() {
       }
       // long press in PINNED → no-op
     }
+  }
+
+  // --- Row-1 overlay expiry: clear and hand row 1 back to KEYER ---
+  if (lcdRow1OverlayUntilMs != 0 && now >= lcdRow1OverlayUntilMs) {
+    lcdRow1OverlayUntilMs = 0;
+    lcd.setCursor(0, 1);
+    lcd.print(F("                "));
+    keyerLcdTxCol = 0;       // reset KEYER cursor to start of row
+    keyerRow1Locked = false; // KEYER may write to row 1 again
   }
 
   lcd_render(false);
