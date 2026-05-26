@@ -388,7 +388,9 @@ const unsigned long CIV_POLL_INTERVAL_FAST  = 200;
 const unsigned long CIV_WATCHDOG_MS         = 10000;
 
 unsigned long CivFreq  = 0;       // Hz, last parsed frequency
-uint8_t       CivMode  = 0xFF;    // raw CI-V mode byte; 0xFF = unknown
+// Boot default = CW (0x03). When CI-V is silent (!CivValid) the MODE button
+// rotates this locally; once rig data arrives, broadcasts overwrite it.
+uint8_t       CivMode  = 0x03;    // raw CI-V mode byte
 bool          CivValid = false;
 
 static unsigned long civLastPollMs       = 0;
@@ -920,7 +922,7 @@ void ptt_loop() {
 // - PTT timing: first element (sidetone + key) defers until the sequencer
 //   reaches SequencerLevel == PttOut. K3NG's own PTTlead/PTTtail removed —
 //   the sequencer alone owns PTT timing.
-// - WPM editable via MEM1 (down) / MEM2 (up) when LCD is in PINNED state
+// - WPM editable via DWN (down) / UP (up) when LCD is in PINNED state
 //   (handled in LCD RUNTIME — this module exposes keyer_set_wpm()).
 // - EEPROM addrs 1..6 persist user changes (5 s debounced flush).
 //   On boot EEPROM > cfg (cfg only used if EEPROM byte == 0xFF).
@@ -966,6 +968,7 @@ const uint8_t KEYER_SENDBUF_SIZE = 65;
 static char    keyerSendBuf[KEYER_SENDBUF_SIZE];
 static uint8_t keyerSendHead = 0;
 static uint8_t keyerSendTail = 0;
+const char     KEYER_LCD_SPACE_MARKER = 0x01;  // internal, not sent on CW/RTTY
 
 // --- RTTY TX state machine (45.45 Bd default: ~22 ms per bit) ---
 static uint8_t       keyerRttyCode      = 0;     // current Baudot 5-bit code
@@ -1156,6 +1159,7 @@ static unsigned long keyerLastTxMs = 0; // for PTT hang-time release
 enum KeyerSending : uint8_t { KEYS_NONE = 0, KEYS_MANUAL = 1, KEYS_AUTO = 2 };
 static KeyerSending keyerSendingMode = KEYS_NONE;
 static bool    keyerAutoInterrupted = false;
+const uint8_t  KEYER_CMOS_SUPER_KEYER_B_TIMING_PERCENT = 33;
 
 // ----- FSK polarity & line release helpers -----
 // MARK and SPACE bit levels flip together when KeyerFskReverseNow is true.
@@ -1197,6 +1201,41 @@ static void keyer_check_paddles() {
   }
 }
 
+// K3NG CMOS Super Keyer timing: during the first part of an element, defer
+// opposite-paddle latching and clear an early squeeze. After the threshold,
+// scan the opposite paddle normally. This makes iambic B less eager to create
+// an extra trailing element.
+static void keyer_check_paddles_cmos(unsigned long elapsed_us, unsigned long total_us) {
+  if (keyerBeingSent == 0 || total_us == 0) {
+    keyer_check_paddles();
+    return;
+  }
+
+  bool ditPressed = keyer_paddle_dit_pressed();
+  bool dahPressed = keyer_paddle_dah_pressed();
+
+  if (KeyerActiveMode == 'A' && ditPressed && dahPressed) {
+    keyerIambicAFlag = 1;
+  }
+
+  if ((elapsed_us * 100UL) >= (total_us * KEYER_CMOS_SUPER_KEYER_B_TIMING_PERCENT)) {
+    if (keyerBeingSent == 1) {
+      if (dahPressed) keyerDahBuf = 1;
+    } else if (keyerBeingSent == 2) {
+      if (ditPressed) keyerDitBuf = 1;
+    }
+  } else if (ditPressed && dahPressed) {
+    keyerDitBuf = 0;
+    keyerDahBuf = 0;
+  }
+}
+
+static uint16_t keyer_sidetone_hz_for_mode() {
+  if (KeyerSidetoneNow != 0) return KeyerSidetoneNow;
+  if (CivValid && (CivMode == 0x04 || CivMode == 0x08)) return 600;
+  return 0;
+}
+
 // ----- Wait with module pumping & paddle scanning -----
 // CW elements and RTTY bits block for tens to hundreds of ms — pump other
 // module loops here so TrxNet CON ACKs, CI-V polling, Ethernet keepalive,
@@ -1204,12 +1243,13 @@ static void keyer_check_paddles() {
 // re-entrancy during element timing.
 static void keyer_wait_us_pump(unsigned long us) {
   unsigned long start = micros();
-  while ((micros() - start) < us) {
+  unsigned long elapsed;
+  while ((elapsed = micros() - start) < us) {
     ethernet_loop();
     trxnet_loop();
     civ_loop();
     ptt_loop();
-    keyer_check_paddles();
+    keyer_check_paddles_cmos(elapsed, us);
     if (trxCwAbort) break;
     if (keyerSendingMode == KEYS_AUTO &&
         (keyer_paddle_dit_pressed() || keyer_paddle_dah_pressed()
@@ -1220,24 +1260,6 @@ static void keyer_wait_us_pump(unsigned long us) {
     }
   }
 }
-
-// Variant of wait_us_pump that does NOT scan paddles — used as a quiet window
-// at the start of the inter-element gap. PCB has bypass capacitors on paddle
-// lines (~100 nF); after a release the cap charges through the internal
-// pull-up over a few ms. Without this window, the MCU sees LOW during cap
-// recovery and latches a spurious buffer, producing extra dits/dahs (single
-// 'E' comes out as 'I' etc.).
-static void keyer_wait_us_no_scan(unsigned long us) {
-  unsigned long start = micros();
-  while ((micros() - start) < us) {
-    ethernet_loop();
-    trxnet_loop();
-    civ_loop();
-    ptt_loop();
-    if (trxCwAbort) break;
-  }
-}
-const unsigned long KEYER_CAP_QUIET_MS = 5;   // paddle-blind window at element end
 
 // ----- Sequencer gate: request PTT, then block until SequencerLevel == PttOut -----
 // This is the "WAITING_FOR_SEQUENCER" state from the design: first element
@@ -1271,7 +1293,8 @@ static void keyer_emit_element(byte type, bool keyHw) {
     digitalWrite(CW1, HIGH);
     digitalWrite(CW2, HIGH);
   }
-  if (KeyerSidetoneNow != 0) tone(TONE, KeyerSidetoneNow);
+  uint16_t sidetoneHz = keyer_sidetone_hz_for_mode();
+  if (sidetoneHz != 0) tone(TONE, sidetoneHz);
 
   keyer_wait_us_pump(element_ms * 1000UL);
 
@@ -1279,18 +1302,14 @@ static void keyer_emit_element(byte type, bool keyHw) {
     digitalWrite(CW1, LOW);
     digitalWrite(CW2, LOW);
   }
-  if (KeyerSidetoneNow != 0) noTone(TONE);
+  if (sidetoneHz != 0) noTone(TONE);
 
-  // Inter-element gap (1 dit time of silence). First KEYER_CAP_QUIET_MS is
-  // paddle-blind to skip the bypass-cap recovery window — without it a clean
-  // single dit release at element end gets latched as a second dit by the
-  // cap's slow rise through the logic threshold (single 'E' → 'I').
-  keyerBeingSent = 0;
+  // Inter-element gap (1 dit time of silence). Keep keyerBeingSent set through
+  // the gap, as K3NG does, so the CMOS timing still treats this as part of the
+  // current element and only the opposite paddle can be buffered.
   unsigned long inter_us = dit_ms * 1000UL;
-  unsigned long quiet_us = KEYER_CAP_QUIET_MS * 1000UL;
-  if (quiet_us > inter_us) quiet_us = inter_us;
-  keyer_wait_us_no_scan(quiet_us);
-  keyer_wait_us_pump(inter_us - quiet_us);
+  keyer_wait_us_pump(inter_us);
+  keyerBeingSent = 0;
 
   // Accumulate into paddle decoder only for live paddle elements
   if (keyerSendingMode == KEYS_MANUAL) {
@@ -1450,6 +1469,7 @@ static void keyer_send_buffer_drain() {
   char c = keyerSendBuf[keyerSendTail];
   keyerSendTail = (keyerSendTail + 1) % KEYER_SENDBUF_SIZE;
 
+  if (c == KEYER_LCD_SPACE_MARKER) { keyer_lcd_putc(' '); return; }
   if (!CivValid) { keyer_lcd_putc(c); return; }
   if (CivMode == 0x03 || CivMode == 0x07)      keyer_emit_cw_char(c);
   else if (CivMode == 0x04 || CivMode == 0x08) keyer_emit_rtty_char(c);
@@ -1594,6 +1614,7 @@ void keyer_loop() {
     for (uint8_t i = 0; trxPendingCW[i] && i < KEYER_SENDBUF_SIZE - 1; i++) {
       keyer_enqueue_char(trxPendingCW[i]);
     }
+    keyer_enqueue_char(KEYER_LCD_SPACE_MARKER);
   }
 
   // Live paddle (priority) → drives one element per outer iteration
@@ -1614,33 +1635,42 @@ void keyer_loop() {
 // Row-0 renderer running after setup(). Layout: HHHHHHHHHHHH|MMM
 // (12-wide value + separator + 3-char mode).
 // FSM has three states (separator shows which one):
-//   PINNED   sep '|'  — value display, M1/M2 = WPM down/up (live keyer)
-//   BROWSING sep '<'  — navigate menu items via M1/SET (prev/next)
-//   EDITING  sep '='  — edit current item's value via M1/M2 (decrement/increment)
-// MODE button (D36) transitions:
-//   short press in PINNED   → BROWSING (tone 400 Hz)
-//   short press in BROWSING → PINNED  (tone 300 Hz, persist menu idx)
-//   long press  in BROWSING → EDITING (if item editable, tone 800 Hz, save pre-value)
-//   short press in EDITING  → BROWSING with save (tone 600 Hz, write EEPROM)
-//   long press  in EDITING  → BROWSING with cancel (tone 200 Hz, restore pre-value)
-// Menu items 0..8: read-only (call/FW/IP/baud/CIV/freq/peers/PTT).
-// Menu items 9..14: editable keyer settings (WPM/Mode/Pad/Sidetone/Bd/FSK).
-// Menu item 15:    editable serial debug toggle (not persisted).
-// PINNED WPM ±: M1/M2 with auto-repeat (500 ms hold → 5/s repeat). M1 = down,
-// M2 = up. Each fires keyer_set_wpm() which marks the keyer EEPROM dirty for
-// debounced flush.
+//   PINNED   sep '|'  — value display, DWN/UP = WPM down/up (live keyer)
+//   BROWSING sep '<'  — navigate menu items via DWN/UP (prev/next, edge-only)
+//   EDITING  sep '='  — edit current item's value via DWN/UP (dec/inc, auto-rep)
+// SET button transitions:
+//   any  press  in PINNED   → BROWSING (fires on press edge; long press in
+//                             PINNED has no special meaning — nothing to edit)
+//   short press in BROWSING → PINNED   (persist menu idx)
+//   long  press in BROWSING → EDITING  (if item editable; fires on threshold)
+//   any  press  in EDITING  → BROWSING with save (write EEPROM; no cancel path)
+//   BROWSING auto-timeout → PINNED after 30 s of no panel activity
+// MODE button (D36): rotates CivMode LSB→USB→AM→CW→RTY→FM→CWR→RTR→LSB on every
+// press, but only while !CivValid (rig silent). When CI-V is reading mode from
+// the rig, MODE is inactive (rig is source of truth). Boot init = CW.
+// Menu items 0..6:   read-only (call/FW/IP/baud/CIV/freq).
+// Menu item 7:       peer count; long-press SET browses known peer IP tails.
+// Menu items 8..14:  editable sequencer settings in runtime order (not persisted).
+// Menu item 15:      editable PTT output (not persisted — cfg/default after reset).
+// Menu items 16..21: editable keyer settings (WPM/Mode/Pad/Sidetone/Bd/FSK).
+// Menu item 22:      editable serial debug toggle (not persisted).
+// Auto-repeat: 700 ms hold → 3 Hz. Active only in PINNED (WPM ±) and EDITING
+// (value dec/inc). BROWSING navigation is edge-only — one menu step per press.
+// Tones: only on BROWSING↔EDITING transition (low→high entering, high→low
+// leaving). No tones for PINNED↔BROWSING, DWN/UP steps, or MODE rotation.
 // Pull model: every LCD_TICK_MS samples buttons + sources, redraws only the
 // parts of row 0 that changed. Row 1 is owned by the KEYER block for TX text.
-// Buttons on MEM (A1) voltage divider, left-to-right on the panel:
-//   M1   tmp < 5
-//   SET  45 < tmp < 130
-//   M2   130 < tmp < 210
+// Buttons on MEM (A1) voltage divider, decision levels at midpoints between
+// measured raw ADC values (SET≈2, DWN≈89, UP≈167):
+//   SET  tmp < 46
+//   DWN  46 < tmp < 128
+//   UP   128 < tmp < 230
 // Persistence: EEPROM[LCD_EEPROM_IDX_ADDR] = current menu index, written on
 // BROWSING→PINNED transition. Keyer values use their own EEPROM addresses
 // (see KEYER block) — saved by lcd_edit_save().
 #include <EEPROM.h>
 
-const uint8_t LCD_MENU_ITEM_COUNT = 16;
+const uint8_t LCD_MENU_ITEM_COUNT = 23;
 const uint8_t LCD_VALUE_WIDTH     = 12;
 const uint8_t LCD_MODE_WIDTH      = 3;
 const uint8_t LCD_SEP_COL         = 12;
@@ -1649,14 +1679,17 @@ const uint8_t LCD_EEPROM_IDX_ADDR = 0;
 
 const unsigned long LCD_TICK_MS              = 30;
 const unsigned long LCD_MODE_HOLD_MS         = 800;
-const unsigned long LCD_BTN_REPEAT_DELAY_MS  = 500;   // hold this long → start repeating
-const unsigned long LCD_BTN_REPEAT_RATE_MS   = 200;   // 5 Hz repeat
+const unsigned long LCD_BTN_REPEAT_DELAY_MS  = 700;   // hold this long → start repeating
+const unsigned long LCD_BTN_REPEAT_RATE_MS   = 333;   // 3 Hz repeat
 const unsigned long LCD_ROW1_OVERLAY_MS      = 800;   // WPM overlay duration on row 1
-const int           LCD_M1_MAX       = 5;     // M1:  tmp < 5
-const int           LCD_SET_MIN      = 45;    // SET: 45 < tmp < 130
-const int           LCD_SET_MAX      = 130;
-const int           LCD_M2_MIN       = 130;   // M2:  130 < tmp < 210
-const int           LCD_M2_MAX       = 210;
+const unsigned long LCD_BROWSING_TIMEOUT_MS  = 30000; // auto-return to PINNED
+// Decision levels = midpoints between measured raw ADC values
+// (SET≈2, DWN≈89, UP≈167). Midpoints: 46 and 128.
+const int           LCD_SET_MAX      = 46;    // SET: tmp < 46     (raw ~2)
+const int           LCD_DWN_MIN      = 46;    // DWN: 46 < tmp < 128  (raw ~89)
+const int           LCD_DWN_MAX      = 128;
+const int           LCD_UP_MIN       = 128;   // UP:  128 < tmp < 230 (raw ~167)
+const int           LCD_UP_MAX       = 230;
 
 enum LcdState : uint8_t { LCD_PINNED = 0, LCD_BROWSING = 1, LCD_EDITING = 2 };
 
@@ -1666,19 +1699,29 @@ static char          lcdLastValue[LCD_VALUE_WIDTH + 1] = {0};
 static char          lcdLastMode[LCD_MODE_WIDTH + 1]   = {0};
 static char          lcdLastSep      = 0;
 static unsigned long lcdLastTickMs   = 0;
-static unsigned long lcdMenuPressMs  = 0;
-static bool          lcdMenuDown     = false;
-static uint8_t       lcdBtnPrev      = 0;  // 0=none, 1=M1, 2=SET, 3=M2
+// SET press tracking. lcdSetConsumed = press already triggered a state change
+// (PINNED→BROWSING, EDITING→BROWSING-save, or BROWSING→EDITING long-press fire),
+// so the release edge must not re-fire as a short press.
+static bool          lcdSetDown      = false;
+static unsigned long lcdSetPressMs   = 0;
+static bool          lcdSetConsumed  = false;
+static bool          lcdModeDown     = false;  // MODE (D36) edge tracking
+static uint8_t       lcdBtnPrev      = 0;  // 0=none, 1=SET, 2=DWN, 3=UP
 static unsigned long lcdBtnPressMs   = 0;
 static unsigned long lcdBtnRepeatNextMs = 0;
-static int32_t       lcdEditPreValue = 0;  // pre-edit snapshot for cancel/restore
+static unsigned long lcdBrowsingActivityMs = 0;
 static unsigned long lcdRow1OverlayUntilMs = 0;  // 0 = no overlay active
+static uint8_t       lcdPeerBrowseIdx = 0;
+// Deferred second tone for BROWSING↔EDITING sweep (non-blocking).
+static unsigned long lcdTonePendingMs = 0;
+static uint16_t      lcdTonePendingHz = 0;
 
-static uint8_t lcd_read_button() {
+static uint8_t lcd_read_button(int *rawOut = nullptr) {
   int tmp = analogRead(MEM);
-  if (tmp < LCD_M1_MAX)                         return 1;  // M1
-  if (tmp > LCD_SET_MIN && tmp < LCD_SET_MAX)   return 2;  // SET
-  if (tmp > LCD_M2_MIN  && tmp < LCD_M2_MAX)    return 3;  // M2
+  if (rawOut) *rawOut = tmp;
+  if (tmp < LCD_SET_MAX)                        return 1;  // SET
+  if (tmp > LCD_DWN_MIN && tmp < LCD_DWN_MAX)   return 2;  // DWN
+  if (tmp > LCD_UP_MIN  && tmp < LCD_UP_MAX)    return 3;  // UP
   return 0;
 }
 
@@ -1692,9 +1735,17 @@ static void lcd_pad_left_align(const char* src, char* out, uint8_t width) {
   out[width] = 0;
 }
 
-static void lcd_format_value(uint8_t idx, char* out) {
-  char raw[LCD_VALUE_WIDTH + 1];
+// In BROWSING/EDITING, editable items render '=' between name and value instead
+// of a space — a visual hint that long-press SET enters EDITING. Read-only
+// items and PINNED state are unaffected. Item 15 in EDITING also switches its
+// rendering from "effective PTT with D/TX prefix" to the raw target value.
+static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
+  // Work buffer larger than LCD_VALUE_WIDTH so case 6 freq ("MMM.MMM.D kHz",
+  // 13 chars) and "---.---.- kHz" placeholder fit; lcd_pad_left_align truncates
+  // back to LCD_VALUE_WIDTH when writing to out[].
+  char raw[20];
   raw[0] = 0;
+  char s = (state != LCD_PINNED) ? '=' : ' ';
 
   switch (idx) {
     case 0:  // mycall
@@ -1735,41 +1786,77 @@ static void lcd_format_value(uint8_t idx, char* out) {
       break;
     case 7:  // peers
       if (NET_ID == 0x00 || !trxNetStarted) { strcpy(raw, "Peers off"); break; }
-      snprintf(raw, sizeof(raw), "Peers %d", net.peerCount());
-      break;
-    case 8:  // current PTT output (1/2/3) or 'D' for default fallback
       {
+        int peers = net.peerCount();
+        if (peers <= 0) { strcpy(raw, "Peers 0"); break; }
+        if (lcdPeerBrowseIdx >= (uint8_t)peers) lcdPeerBrowseIdx = 0;
+        if (state == LCD_EDITING) {
+          const TrxPeer* peer = net.peer(lcdPeerBrowseIdx);
+          if (peer) snprintf(raw, sizeof(raw), "%.7s .%u", peer->name, peer->ip[3]);
+          else      snprintf(raw, sizeof(raw), "P?/%u", peers);
+        } else {
+          snprintf(raw, sizeof(raw), "Peers%c%d", s, peers);
+        }
+      }
+      break;
+    case 8:  // InterlockEnable: 1 = PA interlock, 0 = external PTT input
+      snprintf(raw, sizeof(raw), "Inter%c%u", s, InterlockEnable ? 1 : 0);
+      break;
+    case 9:  // SEQUENCERlead: after SEQ HIGH before PA HIGH
+      snprintf(raw, sizeof(raw), "SeqH%c%dms", s, SEQUENCERlead);
+      break;
+    case 10:  // PAlead: after PA HIGH before PTT HIGH
+      snprintf(raw, sizeof(raw), "PAH%c%dms", s, PAlead);
+      break;
+    case 11:  // PTTlead (loaded from cfg; currently not used by sequencer)
+      snprintf(raw, sizeof(raw), "PTTH%c%dms", s, PTTlead);
+      break;
+    case 12:  // PTTtail: before PTT LOW
+      snprintf(raw, sizeof(raw), "PTTL%c%dms", s, PTTtail);
+      break;
+    case 13:  // PAtail: after PTT LOW before PA LOW
+      snprintf(raw, sizeof(raw), "PAL%c%dms", s, PAtail);
+      break;
+    case 14:  // SEQUENCERtail: after PA LOW before SEQ LOW
+      snprintf(raw, sizeof(raw), "SeqL%c%dms", s, SEQUENCERtail);
+      break;
+    case 15:  // PTT output: BROWSING/PINNED = effective (1/2/3 or D, "TX " when active);
+             // EDITING = raw target value (always 1/2/3 after normalization)
+      if (state == LCD_EDITING) {
+        byte v = (CivValid && CivMode < 16) ? PttOutByCivMode[CivMode] : PTTmodeDefault;
+        snprintf(raw, sizeof(raw), "PTT=%u", v);
+      } else {
         byte n = ptt_output_for_civmode();
         bool isDefault = (!CivValid || CivMode == 0xFF || CivMode >= 16
                           || PttOutByCivMode[CivMode] < 1
                           || PttOutByCivMode[CivMode] > 3);
         const char* prefix = (SequencerLevel != 0) ? "TX " : "";
-        if (isDefault) snprintf(raw, sizeof(raw), "%sPTT D", prefix);
-        else           snprintf(raw, sizeof(raw), "%sPTT %u", prefix, n);
+        if (isDefault) snprintf(raw, sizeof(raw), "%sPTT%cD", prefix, s);
+        else           snprintf(raw, sizeof(raw), "%sPTT%c%u", prefix, s, n);
       }
       break;
-    case 9:   // KEYER WPM
-      snprintf(raw, sizeof(raw), "WPM %u", KeyerWpm);
+    case 16:  // KEYER WPM
+      snprintf(raw, sizeof(raw), "WPM%c%u", s, KeyerWpm);
       break;
-    case 10:  // KEYER iambic mode
-      snprintf(raw, sizeof(raw), "Mode %c", KeyerActiveMode);
+    case 17:  // KEYER iambic mode
+      snprintf(raw, sizeof(raw), "Mode%c%c", s, KeyerActiveMode);
       break;
-    case 11:  // KEYER paddle reverse
-      snprintf(raw, sizeof(raw), "Pad %c", KeyerPaddleSwap ? 'R' : 'N');
+    case 18:  // KEYER paddle reverse
+      snprintf(raw, sizeof(raw), "Pad%c%c", s, KeyerPaddleSwap ? 'R' : 'N');
       break;
-    case 12:  // KEYER sidetone Hz (0 = off)
-      if (KeyerSidetoneNow == 0) strcpy(raw, "Side off");
-      else snprintf(raw, sizeof(raw), "Side %uHz", KeyerSidetoneNow);
+    case 19:  // KEYER sidetone Hz (0 = off)
+      if (KeyerSidetoneNow == 0) snprintf(raw, sizeof(raw), "Side%coff", s);
+      else snprintf(raw, sizeof(raw), "Side%c%uHz", s, KeyerSidetoneNow);
       break;
-    case 13:  // KEYER RTTY baud: 45 shows "45.45 Bd", others "NN Bd"
-      if (KeyerRttyBaudNow == 45) strcpy(raw, "RTY 45.45 Bd");
-      else snprintf(raw, sizeof(raw), "RTY %u Bd", KeyerRttyBaudNow);
+    case 20:  // KEYER RTTY baud: 45 shows "45.45 Bd", others "NN Bd"
+      if (KeyerRttyBaudNow == 45) snprintf(raw, sizeof(raw), "RTY%c45.45 Bd", s);
+      else snprintf(raw, sizeof(raw), "RTY%c%u Bd", s, KeyerRttyBaudNow);
       break;
-    case 14:  // KEYER FSK polarity
-      snprintf(raw, sizeof(raw), "FSK %c", KeyerFskReverseNow ? 'R' : 'N');
+    case 21:  // KEYER FSK polarity
+      snprintf(raw, sizeof(raw), "FSK%c%c", s, KeyerFskReverseNow ? 'R' : 'N');
       break;
-    case 15:  // serial debug toggle (not persisted)
-      strcpy(raw, serialDebug ? "Debug on" : "Debug off");
+    case 22:  // serial debug toggle (not persisted)
+      snprintf(raw, sizeof(raw), "Debug%c%s", s, serialDebug ? "on" : "off");
       break;
     default:
       strcpy(raw, "?");
@@ -1779,16 +1866,19 @@ static void lcd_format_value(uint8_t idx, char* out) {
 }
 
 static void lcd_format_mode(char* out) {
-  if (!CivValid || CivMode == 0xFF) { strcpy(out, "---"); return; }
+  // CivValid → uppercase (rig authoritative). !CivValid → lowercase (local
+  // fallback set via MODE button; boot default = CW). 0xFF retained for safety
+  // even though boot init is 0x03.
+  if (CivMode == 0xFF) { strcpy(out, "---"); return; }
   switch (CivMode) {
-    case 0x00: strcpy(out, "LSB"); break;
-    case 0x01: strcpy(out, "USB"); break;
-    case 0x02: strcpy(out, "AM "); break;
-    case 0x03: strcpy(out, "CW "); break;
-    case 0x04: strcpy(out, "RTY"); break;
-    case 0x05: strcpy(out, "FM "); break;
-    case 0x07: strcpy(out, "CWR"); break;
-    case 0x08: strcpy(out, "RTR"); break;
+    case 0x00: strcpy(out, CivValid ? "LSB" : "lsb"); break;
+    case 0x01: strcpy(out, CivValid ? "USB" : "usb"); break;
+    case 0x02: strcpy(out, CivValid ? "AM " : "am "); break;
+    case 0x03: strcpy(out, CivValid ? "CW " : "cw "); break;
+    case 0x04: strcpy(out, CivValid ? "RTY" : "rty"); break;
+    case 0x05: strcpy(out, CivValid ? "FM " : "fm "); break;
+    case 0x07: strcpy(out, CivValid ? "CWR" : "cwr"); break;
+    case 0x08: strcpy(out, CivValid ? "RTR" : "rtr"); break;
     default:   snprintf(out, LCD_MODE_WIDTH + 1, "?%02X", CivMode); break;
   }
 }
@@ -1803,7 +1893,7 @@ static void lcd_render(bool force) {
     default:           sep = '|'; break;
   }
 
-  lcd_format_value(lcdMenuIdx, value);
+  lcd_format_value(lcdMenuIdx, value, lcdState);
   lcd_format_mode(mode);
 
   if (force || strcmp(value, lcdLastValue) != 0) {
@@ -1839,7 +1929,7 @@ void lcd_runtime_init() {
   lcdLastTickMs = millis();
 }
 
-// ----- Row-1 overlay (transient WPM display during PINNED M1/M2 edit) -----
+// ----- Row-1 overlay (transient WPM display during PINNED DWN/UP edit) -----
 // Briefly overrides KEYER's row-1 TX text with "WPM NN" so the operator gets
 // immediate visual feedback when changing speed with the panel buttons.
 // During the overlay window, keyer_lcd_putc drops chars from the LCD (TX
@@ -1855,61 +1945,79 @@ static void lcd_row1_overlay_wpm() {
   lcdRow1OverlayUntilMs = millis() + LCD_ROW1_OVERLAY_MS;
 }
 
-// ----- Editable-item helpers (items 9..13) -----
+// ----- Editable-item helpers -----
 
 static bool lcd_item_is_editable(uint8_t idx) {
-  return idx >= 9 && idx <= 15;
+  return idx == 7 || (idx >= 8 && idx <= 22);
 }
 
-static int32_t lcd_item_get_value(uint8_t idx) {
-  switch (idx) {
-    case 9:  return (int32_t)KeyerWpm;
-    case 10: return (KeyerActiveMode == 'A') ? 0 : 1;
-    case 11: return KeyerPaddleSwap ? 1 : 0;
-    case 12: return (int32_t)KeyerSidetoneNow;
-    case 13: return (int32_t)KeyerRttyBaudNow;
-    case 14: return KeyerFskReverseNow ? 1 : 0;
-    case 15: return serialDebug ? 1 : 0;
-    default: return 0;
-  }
-}
-
-static void lcd_item_set_value(uint8_t idx, int32_t v) {
-  switch (idx) {
-    case 9:  KeyerWpm = (uint8_t)v; break;
-    case 10: KeyerActiveMode = (v == 0) ? 'A' : 'B'; break;
-    case 11: KeyerPaddleSwap = (v != 0); break;
-    case 12: KeyerSidetoneNow = (uint16_t)v; break;
-    case 13: KeyerRttyBaudNow = (uint8_t)v;
-             keyerRttyBitMs = (KeyerRttyBaudNow == 45) ? 22UL : (1000UL / KeyerRttyBaudNow);
-             break;
-    case 14: KeyerFskReverseNow = (v != 0);
-             // Polarity affects only the active drive levels during RTTY TX;
-             // line stays released (high-Z) at idle regardless of polarity.
-             keyer_fsk_release();
-             break;
-    case 15: serialDebug = (v != 0); break;
-  }
+static void lcd_edit_ms_value(int* value, int delta) {
+  int v = *value + ((delta > 0) ? 10 : -10);
+  if (v < 0) v = 0;
+  if (v > 9990) v = 9990;
+  *value = v;
 }
 
 // Step the editable value by `delta` (sign matters for ranged items; boolean
 // items toggle regardless of delta sign; baud list cycles by sign).
 static void lcd_edit_step(int delta) {
   switch (lcdMenuIdx) {
-    case 9: {  // WPM 5..50 step ±1
+    case 7: {  // Browse known TrxNet peer IP tails; discovery remains passive.
+      int peers = net.peerCount();
+      if (peers <= 0) { lcdPeerBrowseIdx = 0; break; }
+      int v = (int)lcdPeerBrowseIdx + delta;
+      if (v < 0) v = peers - 1;
+      if (v >= peers) v = 0;
+      lcdPeerBrowseIdx = (uint8_t)v;
+      break;
+    }
+    case 8:  // InterlockEnable 0 ↔ 1
+      InterlockEnable = !InterlockEnable;
+      pttExternal = false;
+      ptt_interlock_active = 0;
+      break;
+    case 9:  // SEQUENCERlead: after SEQ HIGH before PA HIGH
+      lcd_edit_ms_value(&SEQUENCERlead, delta);
+      break;
+    case 10:  // PAlead: after PA HIGH before PTT HIGH
+      lcd_edit_ms_value(&PAlead, delta);
+      break;
+    case 11:  // PTTlead (loaded, currently unused)
+      lcd_edit_ms_value(&PTTlead, delta);
+      break;
+    case 12:  // PTTtail: before PTT LOW
+      lcd_edit_ms_value(&PTTtail, delta);
+      break;
+    case 13:  // PAtail: after PTT LOW before PA LOW
+      lcd_edit_ms_value(&PAtail, delta);
+      break;
+    case 14:  // SEQUENCERtail: after PA LOW before SEQ LOW
+      lcd_edit_ms_value(&SEQUENCERtail, delta);
+      break;
+    case 15: {  // PTT output 1↔2↔3 wrap (target = current mode slot, else default)
+      byte* target = (CivValid && CivMode < 16) ? &PttOutByCivMode[CivMode] : &PTTmodeDefault;
+      int v = (int)(*target);
+      if (v < 1 || v > 3) v = PTTmodeDefault;
+      v += delta;
+      if (v < 1) v = 3;
+      if (v > 3) v = 1;
+      *target = (byte)v;
+      break;
+    }
+    case 16: {  // WPM 5..50 step ±1
       int v = (int)KeyerWpm + delta;
       if (v < 5) v = 5;
       if (v > 50) v = 50;
       KeyerWpm = (uint8_t)v;
       break;
     }
-    case 10:  // Iambic A ↔ B toggle
+    case 17:  // Iambic A ↔ B toggle
       KeyerActiveMode = (KeyerActiveMode == 'A') ? 'B' : 'A';
       break;
-    case 11:  // Paddle Normal ↔ Reverse toggle
+    case 18:  // Paddle Normal ↔ Reverse toggle
       KeyerPaddleSwap = !KeyerPaddleSwap;
       break;
-    case 12: {  // Sidetone: 0 (off) or 300..1200 step ±10. Crosses 300↔0.
+    case 19: {  // Sidetone: 0 (off) or 300..1200 step ±10. Crosses 300↔0.
       int v = (int)KeyerSidetoneNow;
       if (delta > 0) {
         if (v == 0) v = 300;
@@ -1921,7 +2029,7 @@ static void lcd_edit_step(int delta) {
       KeyerSidetoneNow = (uint16_t)v;
       break;
     }
-    case 13: {  // RTTY baud cycle through {45, 50, 75, 100}
+    case 20: {  // RTTY baud cycle through {45, 50, 75, 100}
       static const uint8_t list[] = {45, 50, 75, 100};
       int8_t cur = 0;
       for (int i = 0; i < 4; i++) if (list[i] == KeyerRttyBaudNow) { cur = i; break; }
@@ -1930,29 +2038,61 @@ static void lcd_edit_step(int delta) {
       keyerRttyBitMs = (KeyerRttyBaudNow == 45) ? 22UL : (1000UL / KeyerRttyBaudNow);
       break;
     }
-    case 14:  // FSK polarity Normal ↔ Reverse toggle
+    case 21:  // FSK polarity Normal ↔ Reverse toggle
       KeyerFskReverseNow = !KeyerFskReverseNow;
       keyer_fsk_release();   // ensure line is released (polarity only affects TX bits)
       break;
-    case 15:  // Serial debug on ↔ off toggle
+    case 22:  // Serial debug on ↔ off toggle
       serialDebug = !serialDebug;
       break;
   }
 }
 
+// Schedule a two-step tone sweep (firstHz now, secondHz ~90 ms later). The
+// second tone fires from lcd_loop() so the call is non-blocking — important
+// for keyer timing.
+static void lcd_tone_sweep(uint16_t firstHz, uint16_t secondHz) {
+  tone(TONE, firstHz, 80);
+  lcdTonePendingMs = millis() + 90;
+  lcdTonePendingHz = secondHz;
+}
+
+// CivMode rotation list and forward step. Called from MODE-button edge when
+// !CivValid. Boot init = 0x03 (CW); first MODE press → 0x04 (RTY).
+static const uint8_t CIV_MODE_ROTATION[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x07, 0x08};
+static const uint8_t CIV_MODE_ROTATION_LEN = sizeof(CIV_MODE_ROTATION);
+
+static void civ_mode_cycle_next() {
+  int8_t cur = -1;
+  for (uint8_t i = 0; i < CIV_MODE_ROTATION_LEN; i++) {
+    if (CIV_MODE_ROTATION[i] == CivMode) { cur = (int8_t)i; break; }
+  }
+  uint8_t next = (uint8_t)((cur + 1) % CIV_MODE_ROTATION_LEN);
+  CivMode = CIV_MODE_ROTATION[next];
+}
+
 // Commit the currently-edited value to EEPROM (bypasses keyer's 5 s debounce
-// because the user explicitly hit MODE-short to save).
+// because the user explicitly saved via SET in EDITING).
 static void lcd_edit_save() {
   switch (lcdMenuIdx) {
-    case 9:  EEPROM.update(KEYER_EEPROM_WPM_ADDR,      KeyerWpm); break;
-    case 10: EEPROM.update(KEYER_EEPROM_MODE_ADDR,     (KeyerActiveMode == 'A') ? 0 : 1); break;
-    case 11: EEPROM.update(KEYER_EEPROM_REVERSE_ADDR,  KeyerPaddleSwap ? 1 : 0); break;
-    case 12: EEPROM.update(KEYER_EEPROM_SIDETONE_LO,   (uint8_t)(KeyerSidetoneNow & 0xFF));
+    case 7: break;  // peer browse position is live-only
+    case 8:  // sequencer settings are not persisted — cfg/default repopulates after reset
+    case 9:
+    case 10:
+    case 11:
+    case 12:
+    case 13:
+    case 14:
+    case 15: break;  // PTT output not persisted — cfg/default repopulates after reset
+    case 16: EEPROM.update(KEYER_EEPROM_WPM_ADDR,      KeyerWpm); break;
+    case 17: EEPROM.update(KEYER_EEPROM_MODE_ADDR,     (KeyerActiveMode == 'A') ? 0 : 1); break;
+    case 18: EEPROM.update(KEYER_EEPROM_REVERSE_ADDR,  KeyerPaddleSwap ? 1 : 0); break;
+    case 19: EEPROM.update(KEYER_EEPROM_SIDETONE_LO,   (uint8_t)(KeyerSidetoneNow & 0xFF));
              EEPROM.update(KEYER_EEPROM_SIDETONE_HI,   (uint8_t)(KeyerSidetoneNow >> 8));
              break;
-    case 13: EEPROM.update(KEYER_EEPROM_RTTYBAUD_ADDR, KeyerRttyBaudNow); break;
-    case 14: EEPROM.update(KEYER_EEPROM_FSKREV_ADDR,   KeyerFskReverseNow ? 1 : 0); break;
-    case 15: // serial debug not persisted; announce state-change unconditionally
+    case 20: EEPROM.update(KEYER_EEPROM_RTTYBAUD_ADDR, KeyerRttyBaudNow); break;
+    case 21: EEPROM.update(KEYER_EEPROM_FSKREV_ADDR,   KeyerFskReverseNow ? 1 : 0); break;
+    case 22: // serial debug not persisted; announce state-change unconditionally
              Serial.print(F("[Debug "));
              Serial.print(serialDebug ? F("ON") : F("OFF"));
              Serial.println(']');
@@ -1960,14 +2100,27 @@ static void lcd_edit_save() {
   }
 }
 
+static void lcd_pin_menu() {
+  lcdState = LCD_PINNED;
+  EEPROM.update(LCD_EEPROM_IDX_ADDR, lcdMenuIdx);
+}
+
 void lcd_loop() {
   if (millis() - lcdLastTickMs < LCD_TICK_MS) return;
   lcdLastTickMs = millis();
   unsigned long now = lcdLastTickMs;
 
-  uint8_t btnNow = lcd_read_button();
+  int btnRaw = 0;
+  uint8_t btnNow = lcd_read_button(&btnRaw);
   bool isEdge = (btnNow != 0 && lcdBtnPrev != btnNow);
   bool isHeld = (btnNow != 0 && btnNow == lcdBtnPrev);
+
+  if (isEdge && serialDebug) {
+    const char* name = (btnNow == 1) ? "SET" : (btnNow == 2) ? "DWN" : "UP";
+    Serial.print(F("[BTN ")); Serial.print(name);
+    Serial.print(F(" raw=")); Serial.print(btnRaw);
+    Serial.println(']');
+  }
 
   if (isEdge) {
     lcdBtnPressMs = now;
@@ -1976,70 +2129,92 @@ void lcd_loop() {
   bool isRepeat = isHeld && (now >= lcdBtnRepeatNextMs);
   if (isRepeat) lcdBtnRepeatNextMs = now + LCD_BTN_REPEAT_RATE_MS;
 
-  // --- BROWSING: edge-only navigation via M1 (prev) / SET (next); M2 ignored ---
-  if (lcdState == LCD_BROWSING && isEdge) {
-    if (btnNow == 1) {
+  // --- DWN / UP handling: state-dependent, auto-repeat only in PINNED/EDITING ---
+  bool dwnUpEdge   = (btnNow == 2 || btnNow == 3) && isEdge;
+  bool dwnUpRepeat = (btnNow == 2 || btnNow == 3) && isRepeat
+                     && (lcdState == LCD_PINNED || lcdState == LCD_EDITING);
+
+  if (lcdState == LCD_BROWSING && dwnUpEdge) {
+    // Edge-only menu navigation, one step per press
+    lcdBrowsingActivityMs = now;
+    if (btnNow == 2) {
       lcdMenuIdx = (lcdMenuIdx + LCD_MENU_ITEM_COUNT - 1) % LCD_MENU_ITEM_COUNT;
-    } else if (btnNow == 2) {
+    } else {
       lcdMenuIdx = (lcdMenuIdx + 1) % LCD_MENU_ITEM_COUNT;
     }
+  } else if (lcdState == LCD_EDITING && (dwnUpEdge || dwnUpRepeat)) {
+    lcd_edit_step(btnNow == 2 ? -1 : +1);
+  } else if (lcdState == LCD_PINNED && (dwnUpEdge || dwnUpRepeat)) {
+    if (btnNow == 2) keyer_set_wpm((KeyerWpm > 5)  ? KeyerWpm - 1 : 5);
+    else             keyer_set_wpm((KeyerWpm < 50) ? KeyerWpm + 1 : 50);
+    lcd_row1_overlay_wpm();   // refresh overlay each step (extends timer)
   }
 
-  // --- EDITING: M1 = decrement, M2 = increment (auto-repeat); SET ignored ---
-  if (lcdState == LCD_EDITING && (isEdge || isRepeat)) {
-    if (btnNow == 1)      lcd_edit_step(-1);
-    else if (btnNow == 3) lcd_edit_step(+1);
-    if (isEdge) tone(TONE, 700, 20);
-  }
-
-  // --- PINNED: M1/M2 = WPM down/up with auto-repeat; SET ignored ---
-  if (lcdState == LCD_PINNED && (isEdge || isRepeat)) {
-    if (btnNow == 1)      keyer_set_wpm((KeyerWpm > 5)  ? KeyerWpm - 1 : 5);
-    else if (btnNow == 3) keyer_set_wpm((KeyerWpm < 50) ? KeyerWpm + 1 : 50);
-    if (btnNow == 1 || btnNow == 3) {
-      lcd_row1_overlay_wpm();   // refresh overlay each step (extends timer)
-      if (isEdge) tone(TONE, 600, 30);
+  // --- SET handling: state-dependent, short/long distinguished only in BROWSING ---
+  bool setDownNow = (btnNow == 1);
+  if (setDownNow && !lcdSetDown) {
+    // Press edge
+    lcdSetDown = true;
+    lcdSetPressMs = now;
+    lcdSetConsumed = false;
+    if (lcdState == LCD_PINNED) {
+      // Any SET press in PINNED → BROWSING (no short/long distinction)
+      lcdState = LCD_BROWSING;
+      lcdBrowsingActivityMs = now;
+      lcdSetConsumed = true;
+    } else if (lcdState == LCD_EDITING) {
+      // Any SET press in EDITING → save + BROWSING (high→low sweep)
+      lcd_edit_save();
+      lcdState = LCD_BROWSING;
+      lcdBrowsingActivityMs = now;
+      lcd_tone_sweep(800, 300);
+      lcdSetConsumed = true;
+    } else if (lcdState == LCD_BROWSING) {
+      lcdBrowsingActivityMs = now;
     }
+    // BROWSING: defer until release (short) or long-press threshold
+  } else if (setDownNow && lcdSetDown && !lcdSetConsumed
+             && lcdState == LCD_BROWSING
+             && (now - lcdSetPressMs) >= LCD_MODE_HOLD_MS) {
+    // Long-press threshold reached in BROWSING — enter EDITING if editable
+    if (lcd_item_is_editable(lcdMenuIdx)) {
+      if (lcdMenuIdx == 15) {
+        // Normalize PTT target so EDITING starts on a valid 1..3 value even
+        // when item 15 was showing "PTT D" (unmapped mode or stale slot).
+        byte* target = (CivValid && CivMode < 16) ? &PttOutByCivMode[CivMode] : &PTTmodeDefault;
+        if (*target < 1 || *target > 3) *target = ptt_output_for_civmode();
+      }
+      lcdState = LCD_EDITING;
+      lcd_tone_sweep(300, 800);   // low→high sweep
+    }
+    if (lcdState == LCD_BROWSING) lcdBrowsingActivityMs = now;
+    lcdSetConsumed = true;
+  } else if (!setDownNow && lcdSetDown) {
+    // Release edge
+    if (!lcdSetConsumed && lcdState == LCD_BROWSING) {
+      // Short press in BROWSING → PINNED, persist menu idx
+      lcd_pin_menu();
+    }
+    lcdSetDown = false;
   }
 
   lcdBtnPrev = btnNow;
 
-  // --- MODE button: short / long press dispatch ---
-  bool menuDownNow = (digitalRead(MENU) == LOW);
-  if (menuDownNow && !lcdMenuDown) {
-    lcdMenuPressMs = now;
-    lcdMenuDown = true;
-  } else if (!menuDownNow && lcdMenuDown) {
-    unsigned long held = now - lcdMenuPressMs;
-    lcdMenuDown = false;
-    if (held < LCD_MODE_HOLD_MS) {
-      // SHORT press
-      if (lcdState == LCD_PINNED) {
-        lcdState = LCD_BROWSING;
-        tone(TONE, 400, 50);
-      } else if (lcdState == LCD_BROWSING) {
-        lcdState = LCD_PINNED;
-        EEPROM.update(LCD_EEPROM_IDX_ADDR, lcdMenuIdx);
-        tone(TONE, 300, 20);
-      } else {  // LCD_EDITING → save + back to BROWSING
-        lcd_edit_save();
-        lcdState = LCD_BROWSING;
-        tone(TONE, 600, 40);
-      }
-    } else {
-      // LONG press
-      if (lcdState == LCD_BROWSING && lcd_item_is_editable(lcdMenuIdx)) {
-        lcdEditPreValue = lcd_item_get_value(lcdMenuIdx);
-        lcdState = LCD_EDITING;
-        tone(TONE, 800, 60);
-      } else if (lcdState == LCD_EDITING) {
-        // Cancel: restore pre-edit value
-        lcd_item_set_value(lcdMenuIdx, lcdEditPreValue);
-        lcdState = LCD_BROWSING;
-        tone(TONE, 200, 60);
-      }
-      // long press in PINNED → no-op
-    }
+  // --- MODE button: cycle CivMode when !CivValid (rig silent) ---
+  bool modeDownNow = (digitalRead(MENU) == LOW);
+  if (modeDownNow && !lcdModeDown) {
+    lcdModeDown = true;
+    if (lcdState == LCD_BROWSING) lcdBrowsingActivityMs = now;
+    if (!CivValid) civ_mode_cycle_next();
+    // Active CI-V → press ignored (rig is source of truth for mode)
+  } else if (!modeDownNow && lcdModeDown) {
+    lcdModeDown = false;
+  }
+
+  // --- Deferred second tone of BROWSING↔EDITING sweep ---
+  if (lcdTonePendingMs != 0 && now >= lcdTonePendingMs) {
+    tone(TONE, lcdTonePendingHz, 80);
+    lcdTonePendingMs = 0;
   }
 
   // --- Row-1 overlay expiry: clear and hand row 1 back to KEYER ---
@@ -2049,6 +2224,11 @@ void lcd_loop() {
     lcd.print(F("                "));
     keyerLcdTxCol = 0;       // reset KEYER cursor to start of row
     keyerRow1Locked = false; // KEYER may write to row 1 again
+  }
+
+  if (lcdState == LCD_BROWSING && btnNow == 0 && !modeDownNow
+      && (now - lcdBrowsingActivityMs) >= LCD_BROWSING_TIMEOUT_MS) {
+    lcd_pin_menu();
   }
 
   lcd_render(false);
