@@ -1,4 +1,5 @@
-const char* REV = "20260526";
+
+const char* REV = "20260613";
 
 const int DCIN PROGMEM = A7;      // measure input voltage
 const int DC3V PROGMEM = A6;      // measure 3,3V
@@ -27,7 +28,7 @@ const int SDCS PROGMEM = 53;      // out
 const int AFSK PROGMEM = 29;      // out Switch TX audio path
 const int PTT232 PROGMEM = 3;     // in  PTT from USB/serial interface
 const int FSKDET PROGMEM = 33;    // in  FSK detector from USB/serial interface
-const int WINKEY PROGMEM = 27;    // out disable DTR/RTS from from USB/serial interface during run winkey emulator
+const int WINKEY PROGMEM = 27;    // out P-MOSFET gate: driven LOW permanently to power the DTR/RTS switching elements (enables PTT-232 -> sequencer). HIGH/floating = unpowered
 const int TONE PROGMEM = 4;       // out
 const int ACC4 PROGMEM = 47;      // if enable ACC SHIFT OUT KEYBOARD
 const int ACC5 PROGMEM = 13;      // if enable ACC SHIFT OUT KEYBOARD
@@ -870,6 +871,7 @@ void ptt_setup() {
   pinMode(INTERLOCK, INPUT_PULLUP);
   pinMode(FootSW,    INPUT_PULLUP);
   pinMode(PTT232,    INPUT);
+  pinMode(WINKEY, OUTPUT); digitalWrite(WINKEY, LOW);  // permanently power DTR/RTS switching elements (PTT-232 feeds sequencer via PTT232)
 
   for (uint8_t i = 0; i < 16; i++) PttOutByCivMode[i] = 0xFF;
   PttOutByCivMode[0x00] = PTTmodeLSB;
@@ -1652,6 +1654,10 @@ void keyer_loop() {
 // Menu item 7:       peer count; long-press SET browses known peer IP tails.
 // Menu items 8..14:  editable sequencer settings in runtime order (not persisted).
 // Menu item 15:      editable PTT output (not persisted — cfg/default after reset).
+//                    Right edge of the value field (cols 9..11) shows a live
+//                    input-debug triplet "FIP" — F=FootSw, I=Interlock, P=PTT232;
+//                    upper-case = input active, lower-case = idle (see
+//                    lcd_format_value case 15).
 // Menu items 16..21: editable keyer settings (WPM/Mode/Pad/Sidetone/Bd/FSK).
 // Menu item 22:      editable serial debug toggle (not persisted).
 // Auto-repeat: 700 ms hold → 3 Hz. Active only in PINNED (WPM ±) and EDITING
@@ -1863,6 +1869,17 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
       break;
   }
   lcd_pad_left_align(raw, out, LCD_VALUE_WIDTH);
+
+  // Item 15 input-debug overlay: 3 chars at cols 9..11 (right edge of the value
+  // field, just left of the '|' separator) showing live input states. Upper =
+  // active, lower = idle. F=FootSw (active=pressed/LOW=TX), I=Interlock (raw D2
+  // level, active=LOW since INPUT_PULLUP idles HIGH, regardless of
+  // InterlockEnable), P=PTT232 (active=HIGH=TX).
+  if (idx == 15) {
+    out[9]  = (!pttFootSwLast)           ? 'F' : 'f';
+    out[10] = (pttInterlockLast == LOW)  ? 'I' : 'i';
+    out[11] = (pttPtt232Last)            ? 'P' : 'p';
+  }
 }
 
 static void lcd_format_mode(char* out) {

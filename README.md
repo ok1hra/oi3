@@ -32,6 +32,7 @@ means.
   - [Mode → output mapping](#mode--output-mapping)
   - [Sequencer timing](#sequencer-timing)
   - [Inputs](#inputs)
+  - [Input-debug overlay](#input-debug-overlay)
   - [InterlockEnable=1 (safety mode)](#interlockenable1-safety-mode)
   - [InterlockEnable=0 (PTT-in mode)](#interlockenable0-ptt-in-mode)
 - [Keyer (K3NG-derived, CW + RTTY/FSK)](#keyer-k3ng-derived-cw--rttyfsk)
@@ -235,7 +236,7 @@ right of row 0 is the same on every item.
 | 12 | PTT tail      | `PTTL 210ms`         | yes (not persisted) | 0..9990 ms step 10   | Delay after TX-off before PTT1/2/3 LOW. |
 | 13 | PA tail       | `PAL 0ms`            | yes (not persisted) | 0..9990 ms step 10   | Delay from PTT1/2/3 LOW to PTTPA LOW. |
 | 14 | SEQ tail      | `SeqL 0ms`           | yes (not persisted) | 0..9990 ms step 10   | Delay from PTTPA LOW to SEQUENCER LOW. |
-| 15 | PTT output    | `PTT1` / `TX PTT3` / `PTT D` | yes (not persisted) | 1, 2, 3 | Effective PTT pin for the **current CI-V mode**. `D`=default (no mapping / CI-V silent), `TX `=sequencer active. Edit changes the per-mode slot in RAM; `oi3.cfg` repopulates after reset. |
+| 15 | PTT output    | `PTT1` / `TX PTT3` / `PTT D` | yes (not persisted) | 1, 2, 3 | Effective PTT pin for the **current CI-V mode**. `D`=default (no mapping / CI-V silent), `TX `=sequencer active. Edit changes the per-mode slot in RAM; `oi3.cfg` repopulates after reset. The right edge of the value field also shows a live input-debug triplet `FIP` — see [Input-debug overlay](#input-debug-overlay). |
 | 16 | WPM           | `WPM 28`             | yes      | 5..50 step 1                    | Keyer speed. Also editable via DWN/UP in PINNED. |
 | 17 | Iambic mode   | `Mode B`             | yes      | A ↔ B                           | Iambic A or B. |
 | 18 | Paddle        | `Pad N` / `Pad R`    | yes      | Normal ↔ Reverse                | Swap dit/dah paddle assignment. |
@@ -397,6 +398,25 @@ relay/PA characteristics.
 | FootSW    | D19 | HIGH (pullup)     | LOW    | External foot-switch PTT request.          |
 | PTT232    | D3  | LOW               | HIGH   | PTT from the USB/serial-port interface.    |
 | INTERLOCK | D2  | (see below)       | edge   | Dual behaviour — see below.                |
+
+### Input-debug overlay
+
+Menu item 15 (PTT output) shows a live three-character input-debug
+triplet at the right edge of the value field, just left of the `|`
+separator (e.g. `PTT=2    fiP|USB`). Each character is one input;
+**upper-case = active, lower-case = idle**:
+
+| Char | Input    | Upper-case (active) when…                              |
+|------|----------|--------------------------------------------------------|
+| `F`  | FootSW   | switch pressed (D19 LOW = TX)                           |
+| `I`  | INTERLOCK| raw D2 level LOW (pulled — regardless of `InterlockEnable`) |
+| `P`  | PTT232   | D3 HIGH (= TX)                                          |
+
+`I` reflects the **raw pin level**, not the derived interlock/abort
+logic, so it stays useful for tracing wiring and contact bounce in
+either interlock mode. The triplet refreshes every `LCD_TICK_MS`
+(30 ms) and only appears on item 15; all other menu items render
+normally.
 
 ### InterlockEnable=1 (safety mode)
 

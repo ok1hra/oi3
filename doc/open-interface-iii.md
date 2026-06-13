@@ -276,7 +276,7 @@ Note: JP4 jumper selection is required for DTR/RTS CW/FSK routing.
 | D22 | PTT2 | – |
 | D23 | FSK keying | Arduino source |
 | D25 | PTT3 | – |
-| D27 | WinKey | HIGH during CW (disables DTR/RTS) |
+| D27 | WinKey | Driven LOW permanently — powers DTR/RTS switching elements (P-MOSFET gate); HIGH/floating = unpowered |
 | D29 | AFSK | HIGH when AFSK active (switches audio) |
 | D31 | PTT-PA | – |
 | D34 | CW1 | – |
