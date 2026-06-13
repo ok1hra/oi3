@@ -291,11 +291,12 @@ standby, or wired to a different cable.
 
 ### CW over CI-V (CIV_CW_VIA_CIV)
 
-When `CIV_CW_VIA_CIV=1` and the keyer needs to send CW (paddle or
-buffered text in CW/CWR mode), the firmware uses CI-V command 0x17 to
-feed the character to the **radio's built-in keyer**. The local CW1/CW2
-pins and the PTT sequencer are bypassed. With `CIV_CW_VIA_CIV=0`, the
-keyer keys CW1/CW2 directly and PTT goes through the sequencer.
+> **Reserved / not yet implemented.** The `CIV_CW_VIA_CIV` flag is parsed
+> from `oi3.cfg` but currently has no effect: CW is **always** keyed
+> locally via the CW1/CW2 pins and the PTT sequencer, regardless of the
+> flag's value. The intended future behaviour is that `CIV_CW_VIA_CIV=1`
+> would feed decoded characters to the radio's built-in keyer via CI-V
+> command 0x17 (bypassing CW1/CW2 and the sequencer).
 
 ---
 
@@ -446,8 +447,7 @@ TrxNet remote sending, and integration with the OI3 PTT sequencer.
   to item 19) and runs the ASCII decoder regardless of CI-V mode.
 - Mode determines whether the element also drives a TX path:
   - **CW / CWR (0x03 / 0x07):** paddle keys CW1/CW2 via the sequencer.
-    If `CIV_CW_VIA_CIV=1`, decoded characters are also relayed to the
-    radio's internal keyer for transmission.
+    (`CIV_CW_VIA_CIV` is reserved / not yet implemented — see above.)
   - **RTTY / RTR (0x04 / 0x08):** paddle elements still produce
     sidetone in your ear, but the decoded **characters** are enqueued
     to the RTTY FSK state machine instead of being keyed as CW.
@@ -625,7 +625,7 @@ Configuration keys (from `readSDSettings()`):
 | `BAND_DECODER_IN`     | `1`         | 0 / 1                   | 0 = disable CI-V loop; 1 = ICOM CI-V. |
 | `SERBAUD2`            | `9600`      | bps                     | Serial2 baudrate (rig CAT). |
 | `CIV_ADRESS`          | `98` (hex)  | hex byte                | `56`=IC-746, `98`=IC-7610, etc. |
-| `CIV_CW_VIA_CIV`      | `1`         | 0 / 1                   | 1 = send CW via radio internal keyer (cmd 0x17); 0 = key CW1/CW2 + local PTT. |
+| `CIV_CW_VIA_CIV`      | `0`         | 0 / 1                   | **Reserved / not implemented** — parsed but ignored; CW is always keyed locally via CW1/CW2 + sequencer. |
 | `EthernetEnable`      | `1`         | 0 / 1                   | Master Ethernet switch. |
 | `EthernetDHCP`        | `1`         | 0 / 1                   | 1 = DHCP, 0 = static. |
 | `KeyerDefaultWpm`     | `28`        | 5..50                   | Default WPM. EEPROM overrides if not `0xFF`. |

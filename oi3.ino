@@ -121,13 +121,13 @@ byte          PTTmodeDefault  = 3;
 int           BAND_DECODER_IN = 1;
 unsigned long SERBAUD2        = 9600;
 byte          CIV_ADRESS      = 0x98;   // hex
-bool          CIV_CW_VIA_CIV  = true;
+bool          CIV_CW_VIA_CIV  = false;  // RESERVED - parsed but unused; CW is always keyed locally
 bool          EthernetEnable  = true;
 bool          EthernetDHCP    = true;
 // Keyer cfg (overridable from oi3.cfg; EEPROM may further override at boot)
 byte          KeyerDefaultWpm    = 28;     // 5..50
 char          KeyerMode          = 'B';    // 'A' or 'B' (iambic)
-bool          KeyerPaddleReverse = false;  // false=PADDLER is dit, true=swap (PADDLEL is dit)
+bool          KeyerPaddleReverse = false;  // false=PADDLEL is dit, true=swap (PADDLER is dit)
 uint16_t      KeyerSidetoneHz    = 600;    // 0=off, otherwise 300..1200
 byte          KeyerRttyBaud      = 45;     // 45 / 50 / 75 / 100 (45 => 45.45 Bd)
 bool          KeyerFskReverse    = false;  // false: MARK=HIGH/SPACE=LOW; true: inverted
@@ -332,6 +332,9 @@ void ethernet_setup() {
   }
 
   if (!ethernet_bringUp()) {
+    // IP stack is not usable — clear the link flag so trxnet_loop() does not
+    // start TrxNet over a broken stack (it gates on EthLinkStatus).
+    EthLinkStatus = false;
     Serial.println(F("Ethernet: DHCP fail"));
     lcd.clear();
     lcd.setCursor(0, 0);
@@ -733,15 +736,14 @@ byte          ptt_interlock_active = 0;
 byte          PttOut               = 3;        // current selected PTT output 1/2/3
 unsigned long LastSeqChange        = 0;
 
-static bool   pttFootSwLast        = true;     // HIGH at idle (pull-up)
-static bool   pttPtt232Last        = false;    // LOW at idle
-static int    pttInterlockLast     = -1;       // -1 = not yet sampled
-
 byte ptt_output_for_civmode() {
-  if (!CivValid || CivMode == 0xFF) return PTTmodeDefault;
-  if (CivMode >= 16)                return PTTmodeDefault;
+  // Fallback is range-checked too: a bad PTTmodeDefault (from cfg/SD) must never
+  // propagate to PttOut and index PTT_PINS[] out of bounds.
+  byte fallback = (PTTmodeDefault >= 1 && PTTmodeDefault <= 3) ? PTTmodeDefault : 3;
+  if (!CivValid || CivMode == 0xFF) return fallback;
+  if (CivMode >= 16)                return fallback;
   byte v = PttOutByCivMode[CivMode];
-  if (v < 1 || v > 3)               return PTTmodeDefault;
+  if (v < 1 || v > 3)               return fallback;
   return v;
 }
 
@@ -822,43 +824,36 @@ static void ptt_sequencer_step() {
 }
 
 static void ptt_inputs_poll() {
-  // FootSW: LOW = TX
-  bool footSwNow = (digitalRead(FootSW) == HIGH);  // HIGH means released
-  if (footSwNow != pttFootSwLast) {
-    pttFootSwLast = footSwNow;
-    ptt_request(!footSwNow);   // released==true -> tx false; pressed -> tx true
-  }
+  // Each source keeps its own TX request; the resulting TX is the OR of all of
+  // them, so releasing one source never drops TX while another still asserts it.
+  bool footSwTx = (digitalRead(FootSW) == LOW);    // active-low (pull-up): pressed = TX
+  bool ptt232Tx = (digitalRead(PTT232) == HIGH);   // active-high: HIGH = TX
+  bool ilIn     = (digitalRead(INTERLOCK) == LOW); // interlock pin asserted (active-low)
+  bool ilInTx   = false;
 
-  // PTT232: HIGH = TX
-  bool ptt232Now = (digitalRead(PTT232) == HIGH);
-  if (ptt232Now != pttPtt232Last) {
-    pttPtt232Last = ptt232Now;
-    ptt_request(ptt232Now);
-  }
-
-  // INTERLOCK: dual behaviour per InterlockEnable
-  int interlockNow = digitalRead(INTERLOCK);
-  if (pttInterlockLast == -1) {
-    pttInterlockLast = interlockNow;
-  } else if (interlockNow != pttInterlockLast) {
-    pttInterlockLast = interlockNow;
-    if (InterlockEnable) {
-      // safety interlock from PA: edge → toggle abort flag
-      ptt_interlock_active ^= 1;
-      pttExternal = false;
-      if (serialDebug) {
-        Serial.print(F("[Interlock="));
-        Serial.print(ptt_interlock_active);
-        Serial.println(']');
-      }
-    } else {
-      // PTT-in: LOW = TX; pttExternal skips PTT123 in sequencer
-      bool ilTx = (interlockNow == LOW);
-      pttExternal = ilTx;
-      ptt_interlock_active = 0;
-      ptt_request(ilTx);
+  if (InterlockEnable) {
+    // Safety interlock from the PA: LEVEL-based, sampled every poll. An interlock
+    // already asserted at boot is honoured, and a bounce cannot latch the wrong
+    // state — the real pin level always determines the safe state.
+    byte active = ilIn ? 1 : 0;
+    if (active != ptt_interlock_active && serialDebug) {
+      Serial.print(F("[Interlock="));
+      Serial.print(active);
+      Serial.println(']');
     }
+    ptt_interlock_active = active;
+    pttExternal = false;
+  } else {
+    // Interlock pin repurposed as an extra PTT input (active-low = TX).
+    // pttExternal skips PTT123 in the sequencer for this external source.
+    ilInTx = ilIn;
+    pttExternal = ilIn;
+    ptt_interlock_active = 0;
   }
+
+  // ptt_request() is idempotent (no-op when unchanged), so calling it every poll
+  // with the OR is cheap and keeps TX asserted as long as any source requests it.
+  ptt_request(footSwTx || ptt232Tx || ilInTx);
 }
 
 void ptt_setup() {
@@ -882,6 +877,10 @@ void ptt_setup() {
   PttOutByCivMode[0x05] = PTTmodeFM;
   PttOutByCivMode[0x07] = PTTmodeCWR;
   PttOutByCivMode[0x08] = PTTmodeRTR;
+
+  // Sanitize cfg/SD-provided default once, so every fallback path (incl. menu
+  // edit at case 15) sees a valid 1..3 output index.
+  if (PTTmodeDefault < 1 || PTTmodeDefault > 3) PTTmodeDefault = 3;
 
   PttOut = PTTmodeDefault;
   SequencerLevel = 0;
@@ -922,8 +921,8 @@ void ptt_loop() {
 // - Other modes (LSB/USB/AM/FM, or !CivValid): sidetone + LCD echo only,
 //   no TX path activated.
 // - PTT timing: first element (sidetone + key) defers until the sequencer
-//   reaches SequencerLevel == PttOut. K3NG's own PTTlead/PTTtail removed —
-//   the sequencer alone owns PTT timing.
+//   reaches SequencerLevel == PttOut, then waits PTTlead ms (relay settle)
+//   before keying. PTTtail is applied by the sequencer on release.
 // - WPM editable via DWN (down) / UP (up) when LCD is in PINNED state
 //   (handled in LCD RUNTIME — this module exposes keyer_set_wpm()).
 // - EEPROM addrs 1..6 persist user changes (5 s debounced flush).
@@ -1176,13 +1175,14 @@ static inline void keyer_fsk_drive_space() { pinMode(FSK, OUTPUT); digitalWrite(
 static inline void keyer_fsk_drive_mark()  { pinMode(FSK, OUTPUT); digitalWrite(FSK, keyer_fsk_mark());  }
 
 // ----- Paddle pin reads (respects KeyerPaddleSwap) -----
-// Default (KeyerPaddleSwap=false): dit = PADDLER (D28), dah = PADDLEL (D26).
-// KeyerPaddleSwap=true swaps to dit = PADDLEL, dah = PADDLER.
+// Default (KeyerPaddleSwap=false): dit = PADDLEL (D26), dah = PADDLER (D28),
+// matching the hardware labelling and oi3.cfg ("0 = PADDLEL is dit").
+// KeyerPaddleSwap=true swaps to dit = PADDLER, dah = PADDLEL.
 static inline bool keyer_paddle_dit_pressed() {
-  return digitalRead(KeyerPaddleSwap ? PADDLEL : PADDLER) == LOW;
+  return digitalRead(KeyerPaddleSwap ? PADDLER : PADDLEL) == LOW;
 }
 static inline bool keyer_paddle_dah_pressed() {
-  return digitalRead(KeyerPaddleSwap ? PADDLER : PADDLEL) == LOW;
+  return digitalRead(KeyerPaddleSwap ? PADDLEL : PADDLER) == LOW;
 }
 
 // ----- Paddle scan -----
@@ -1277,6 +1277,13 @@ static bool keyer_begin_tx_wait_sequencer() {
     ptt_loop();
     if (trxCwAbort) return false;
     if ((millis() - t0) > 2000) return false;  // safety
+  }
+  // PTTlead: extra settle time after PTT123 closes before the first element
+  // keys, letting the PTT/PA relays settle. 0 = no delay.
+  unsigned long tLead = millis();
+  while ((millis() - tLead) < (unsigned long)PTTlead) {
+    ptt_loop();
+    if (trxCwAbort || SequencerLevel != PttOut) return false;
   }
   return true;
 }
@@ -1814,7 +1821,7 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
     case 10:  // PAlead: after PA HIGH before PTT HIGH
       snprintf(raw, sizeof(raw), "PAH%c%dms", s, PAlead);
       break;
-    case 11:  // PTTlead (loaded from cfg; currently not used by sequencer)
+    case 11:  // PTTlead: settle delay after PTT123 closes before CW keying
       snprintf(raw, sizeof(raw), "PTTH%c%dms", s, PTTlead);
       break;
     case 12:  // PTTtail: before PTT LOW
@@ -1876,9 +1883,9 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
   // level, active=LOW since INPUT_PULLUP idles HIGH, regardless of
   // InterlockEnable), P=PTT232 (active=HIGH=TX).
   if (idx == 15) {
-    out[9]  = (!pttFootSwLast)           ? 'F' : 'f';
-    out[10] = (pttInterlockLast == LOW)  ? 'I' : 'i';
-    out[11] = (pttPtt232Last)            ? 'P' : 'p';
+    out[9]  = (digitalRead(FootSW)    == LOW)  ? 'F' : 'f';
+    out[10] = (digitalRead(INTERLOCK) == LOW)  ? 'I' : 'i';
+    out[11] = (digitalRead(PTT232)    == HIGH) ? 'P' : 'p';
   }
 }
 
@@ -1999,7 +2006,7 @@ static void lcd_edit_step(int delta) {
     case 10:  // PAlead: after PA HIGH before PTT HIGH
       lcd_edit_ms_value(&PAlead, delta);
       break;
-    case 11:  // PTTlead (loaded, currently unused)
+    case 11:  // PTTlead: settle delay after PTT123 before CW keying
       lcd_edit_ms_value(&PTTlead, delta);
       break;
     case 12:  // PTTtail: before PTT LOW
