@@ -1,5 +1,5 @@
 
-const char* REV = "20260613";
+const char* REV = "20260620";
 
 const int DCIN PROGMEM = A7;      // measure input voltage
 const int DC3V PROGMEM = A6;      // measure 3,3V
@@ -733,6 +733,11 @@ byte          SequencerLevel       = 0;       // 0=off, 1/2/3=PTT123, 4=PA, 5=SE
 bool          PttActive            = false;
 bool          pttExternal          = false;
 byte          ptt_interlock_active = 0;
+// Keyer-owned TX request: the CW/RTTY keyer is a PTT source just like FootSw /
+// PTT232 / interlock-in. ptt_inputs_poll() ORs this in so the level-based poll
+// cannot clobber a PTT the keyer is holding between elements. Written only by
+// the KEYER block (begin_tx / tail_service / abort), read here.
+bool          keyerPttRequest      = false;
 byte          PttOut               = 3;        // current selected PTT output 1/2/3
 unsigned long LastSeqChange        = 0;
 
@@ -853,7 +858,10 @@ static void ptt_inputs_poll() {
 
   // ptt_request() is idempotent (no-op when unchanged), so calling it every poll
   // with the OR is cheap and keeps TX asserted as long as any source requests it.
-  ptt_request(footSwTx || ptt232Tx || ilInTx);
+  // keyerPttRequest is the CW/RTTY keyer's source: without it, this level-based
+  // poll would reset PttActive to false on every iteration while the keyer is
+  // mid-element (none of the HW inputs are active for paddle-driven keying).
+  ptt_request(footSwTx || ptt232Tx || ilInTx || keyerPttRequest);
 }
 
 void ptt_setup() {
@@ -1268,6 +1276,11 @@ static void keyer_wait_us_pump(unsigned long us) {
 // (sidetone + key) only fires once the sequencer has brought up SEQ + PA + PTT123.
 // Returns false on abort/timeout.
 static bool keyer_begin_tx_wait_sequencer() {
+  // Assert the keyer's own PTT source first, so ptt_inputs_poll() (called from
+  // ptt_loop() below) keeps PttActive=true instead of resetting it from the HW
+  // inputs every poll. On any failure path, drop it again so a stuck request
+  // never leaves PTT latched.
+  keyerPttRequest = true;
   ptt_request(true);
   unsigned long t0 = millis();
   while (SequencerLevel != PttOut) {
@@ -1275,15 +1288,15 @@ static bool keyer_begin_tx_wait_sequencer() {
     trxnet_loop();
     civ_loop();
     ptt_loop();
-    if (trxCwAbort) return false;
-    if ((millis() - t0) > 2000) return false;  // safety
+    if (trxCwAbort)             { keyerPttRequest = false; return false; }
+    if ((millis() - t0) > 2000) { keyerPttRequest = false; return false; }  // safety
   }
   // PTTlead: extra settle time after PTT123 closes before the first element
   // keys, letting the PTT/PA relays settle. 0 = no delay.
   unsigned long tLead = millis();
   while ((millis() - tLead) < (unsigned long)PTTlead) {
     ptt_loop();
-    if (trxCwAbort || SequencerLevel != PttOut) return false;
+    if (trxCwAbort || SequencerLevel != PttOut) { keyerPttRequest = false; return false; }
   }
   return true;
 }
@@ -1497,6 +1510,7 @@ static void keyer_ptt_tail_service() {
   unsigned long dit_ms = 1200UL / KeyerWpm;
   if ((millis() - keyerLastTxMs) >= (7UL * dit_ms)) {
     keyer_fsk_release();    // float FSK line — no continuous drive between sessions
+    keyerPttRequest = false;  // drop the keyer source; poll OR then releases PTT
     ptt_request(false);
   }
 }
@@ -1532,6 +1546,7 @@ void keyer_abort() {
   digitalWrite(CW2, LOW);
   keyer_fsk_release();          // float the line (high-Z)
   noTone(TONE);
+  keyerPttRequest = false;      // drop the keyer source so the poll OR releases PTT
   ptt_request(false);
   keyerState = KEYER_IDLE;
 }
