@@ -683,8 +683,13 @@ correct serial port, and upload. Pre-built `.hex` files
 shipped in the repository and can be flashed with `avrdude`:
 
 ```sh
-avrdude -p atmega2560 -c wiring -P /dev/ttyUSB0 -b 115200 -D \
-        -U flash:w:oi3.ino.mega.hex:i
+avrdude -p atmega2560 -c wiring -P /dev/ttyUSB0 -b 115200 -D -U flash:w:oi3.ino.mega.hex:i
+```
+
+ICSP variant with effusion setting:
+
+```sh
+avrdude -P /dev/ttyUSB.icsp -b 19200 -c arduino -p m2560 -U flash:w:/home/dan/oi3.ino.with_bootloader.mega.hex -U efuse:w:0xFD:m -U hfuse:w:0xD8:m -U lfuse:w:0xFF:m
 ```
 
 ---
