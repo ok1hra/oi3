@@ -1,5 +1,5 @@
 
-const char* REV = "20260620";
+const char* REV = "20260626";
 
 // ===================== PCB REVISION =====================
 // Selects the pinout (and feature set) for the target PCB. Pass exactly one

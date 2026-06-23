@@ -7,7 +7,5 @@
 # arduino-cli / IDE build cache
 /build/
 
-# Keep only the release .hex images under out/ (drop .elf/.eep/.bin)
-out/**/*.elf
-out/**/*.eep
-out/**/*.bin
+# Build output - binaries are not tracked; regenerate with ./build.sh
+/out/
