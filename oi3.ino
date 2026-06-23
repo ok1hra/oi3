@@ -1,6 +1,23 @@
 
 const char* REV = "20260620";
 
+// ===================== PCB REVISION =====================
+// Selects the pinout (and feature set) for the target PCB. Pass exactly one
+// of these as a build flag, e.g. arduino-cli ... --build-property
+// build.extra_flags=-DPCB_REV_3_141  (see build.sh). If none is given, the
+// newer 3_1415 board is assumed so the sketch still builds in the IDE.
+#if !defined(PCB_REV_3_141) && !defined(PCB_REV_3_1415)
+  #define PCB_REV_3_1415
+#endif
+
+// FEATURE_NET gates the Ethernet + TrxNet stack. The 3_141 board has no
+// Ethernet module install-detect pin (ETHINST) and predates the network
+// feature, so it builds without it (smaller binary).
+#if defined(PCB_REV_3_1415)
+  #define FEATURE_NET
+#endif
+
+#if defined(PCB_REV_3_1415)
 const int DCIN PROGMEM = A7;      // measure input voltage
 const int DC3V PROGMEM = A6;      // measure 3,3V
 const int encA PROGMEM = 24;      // encoder-A
@@ -54,6 +71,60 @@ const int SMTpad1 PROGMEM = 48;   // ^ Internal SMT pad
 const int SMTpad2 PROGMEM = 49;   // -
 const int SMTpad3 PROGMEM = A0;   // v
 
+#elif defined(PCB_REV_3_141)
+// Original PCB rev 3_141 pinout. Signals that physically do not exist on this
+// board (ETHINST, ACC15/16, SelfRES, SMTpad1-3) are intentionally omitted; the
+// network stack that would use ETHINST is compiled out (FEATURE_NET undefined).
+const int DCIN PROGMEM = A7;      // measure input voltage
+const int DC3V PROGMEM = A6;      // measure 3,3V
+const int encA PROGMEM = 24;      // encoder-A
+const int encB PROGMEM = 23;      // encoder-B
+const int MEM PROGMEM = A1;       // K3NG CW key button
+const int CW1 PROGMEM = 11;       // out
+const int CW2 PROGMEM = 12;       //
+const int PTT1 PROGMEM = 13;      //
+const int PTT2 PROGMEM = 22;      //
+const int PTT3 PROGMEM = 25;      // PTT mic
+const int MENU PROGMEM = 36;      // MODE button
+const int FSK PROGMEM = 41;       // FSK output
+const int INTERLOCK PROGMEM = 21; // in
+const int FootSW PROGMEM = 20;    // in
+const byte BCD1 PROGMEM = 42;     // __
+const byte BCD2 PROGMEM = 43;     //   |
+const byte BCD3 PROGMEM = 44;     //   |- band data
+const byte BCD4 PROGMEM = 45;     // __|  from band decoder
+const int PADDLEL PROGMEM = 2;    // in
+const int PADDLER PROGMEM = 5;    // in
+const int SEQUENCER PROGMEM = 40; // out
+const int PTTPA PROGMEM = 31;     // out PA PTT
+const int SDPLUG PROGMEM = A5;    // in  microSD detect
+const int SDCS PROGMEM = 53;      // out
+const int AFSK PROGMEM = 29;      // out Switch TX audio path
+const int PTT232 PROGMEM = 37;    // in  PTT from USB/serial interface
+const int FSKDET PROGMEM = 33;    // in  FSK detector from USB/serial interface
+const int WINKEY PROGMEM = 27;    // out disable DTR/RTS from USB/serial interface during run winkey emulator
+const int TONE PROGMEM = 4;       // out
+const int ACC4 PROGMEM = 47;
+const int ACC5 PROGMEM = 13;
+const int ACC6 PROGMEM = 5;
+const int ACC7 PROGMEM = 30;
+const int ACC8 PROGMEM = 32;
+const int ACC9 PROGMEM = 11;
+const int ACC10 PROGMEM = 12;
+const int ACC11 PROGMEM = 38;
+const int ACC12 PROGMEM = A2;
+const int ACC13 PROGMEM = A3;
+const int ACC14 PROGMEM = A8;
+const int ACC17 PROGMEM = A9;
+const int ACC19 PROGMEM = A11;    // if define Icom ACC voltage input
+// const int MISO = 50;
+// const int MOSI = 51;
+// const int SCK  = 52;
+
+#else
+  #error "No PCB revision selected (define PCB_REV_3_141 or PCB_REV_3_1415)"
+#endif
+
 
 // Operational serial output gate. OFF (default) suppresses periodic runtime
 // chatter ([CIV freq/mode/watchdog], [PTT ...], [Interlock=...]); init banners,
@@ -67,7 +138,11 @@ static bool serialDebug = false;
 #include <LiquidCrystal.h>
 
 #define lcd_rs      A2
-#define lcd_enable  37
+#if defined(PCB_REV_3_1415)
+  #define lcd_enable 37
+#else  // PCB_REV_3_141
+  #define lcd_enable 3
+#endif
 #define lcd_d4      6
 #define lcd_d5      7
 #define lcd_d6      8
@@ -236,11 +311,16 @@ void sdcfg_setup() {
 // Boot: block up to ETH_BOOT_TIMEOUT waiting for link, show IP on LCD ~1 s.
 // Runtime: every ETH_CHECK_INTERVAL poll linkStatus(); on link-up reinit;
 // on DHCP refresh lease via Ethernet.maintain(). Runtime messages → Serial only.
+// Link state is read by the LCD runtime even when the network stack is
+// compiled out (PCB_REV_3_141), so keep these two flags unconditionally
+// defined. They simply stay false when FEATURE_NET is undefined.
+bool          EthLinkStatus      = false;
+bool          EthModulePresent   = false;
+
+#ifdef FEATURE_NET
 #include <Ethernet.h>
 #include <EthernetUdp.h>
 
-bool          EthLinkStatus      = false;
-bool          EthModulePresent   = false;
 unsigned long EthLastCheckMs     = 0;
 const unsigned long ETH_CHECK_INTERVAL = 1000;
 const unsigned long ETH_BOOT_TIMEOUT   = 5000;
@@ -372,6 +452,10 @@ void ethernet_loop() {
     Ethernet.maintain();
   }
 }
+#else  // !FEATURE_NET — board has no Ethernet module (PCB_REV_3_141)
+void ethernet_setup() {}
+void ethernet_loop()  {}
+#endif // FEATURE_NET
 // =================== END ETHERNET ===================
 
 
@@ -604,6 +688,11 @@ void civ_loop() {
 // Greeting: on new peer, sends a CON snapshot of /hz + /mode (drained one
 // peer per loop iteration, gated until CIV state is known).
 
+// Read by the LCD "Peers" menu item even when TrxNet is compiled out
+// (PCB_REV_3_141); stays false on boards without the network stack.
+bool        trxNetStarted = false;
+
+#ifdef FEATURE_NET
 #include <TrxNet.h>
 
 const uint16_t TRXNET_PORT = 5683;
@@ -611,7 +700,6 @@ const uint16_t TRXNET_PORT = 5683;
 EthernetUDP trxUdp;
 TrxNet      net(trxUdp);
 char        trxDeviceName[TRXNET_MAX_DEVICE_NAME];
-bool        trxNetStarted = false;
 
 volatile uint32_t trxPendingHz   = 0;
 volatile uint8_t  trxPendingMode = 0;     // CI-V mode byte
@@ -708,6 +796,12 @@ void trxnet_loop() {
     republishState(trxPendingGreet[trxPendingGreetCount]);
   }
 }
+#else  // !FEATURE_NET — no TrxNet on this PCB (PCB_REV_3_141)
+void trxnet_setup()     {}
+void trxnet_loop()      {}
+void civ_publish_freq() {}
+void civ_publish_mode() {}
+#endif // FEATURE_NET
 // =================== END TRXNET ===================
 
 
@@ -1783,18 +1877,26 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
       snprintf(raw, sizeof(raw), "FW %s", REV);
       break;
     case 2:  // IP-hi "192.168."
+#ifdef FEATURE_NET
       if (!EthLinkStatus) { strcpy(raw, "no link"); break; }
       {
         IPAddress ip = Ethernet.localIP();
         snprintf(raw, sizeof(raw), "%u.%u.", ip[0], ip[1]);
       }
+#else
+      strcpy(raw, "no net");
+#endif
       break;
     case 3:  // IP-lo "1.220"
+#ifdef FEATURE_NET
       if (!EthLinkStatus) { strcpy(raw, "no link"); break; }
       {
         IPAddress ip = Ethernet.localIP();
         snprintf(raw, sizeof(raw), "%u.%u", ip[2], ip[3]);
       }
+#else
+      strcpy(raw, "no net");
+#endif
       break;
     case 4:  // baud
       snprintf(raw, sizeof(raw), "baud %lu", SERBAUD2);
@@ -1813,6 +1915,7 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
       }
       break;
     case 7:  // peers
+#ifdef FEATURE_NET
       if (NET_ID == 0x00 || !trxNetStarted) { strcpy(raw, "Peers off"); break; }
       {
         int peers = net.peerCount();
@@ -1826,6 +1929,9 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
           snprintf(raw, sizeof(raw), "Peers%c%d", s, peers);
         }
       }
+#else
+      strcpy(raw, "Peers off");
+#endif
       break;
     case 8:  // InterlockEnable: 1 = PA interlock, 0 = external PTT input
       snprintf(raw, sizeof(raw), "Inter%c%u", s, InterlockEnable ? 1 : 0);
@@ -2002,12 +2108,14 @@ static void lcd_edit_ms_value(int* value, int delta) {
 static void lcd_edit_step(int delta) {
   switch (lcdMenuIdx) {
     case 7: {  // Browse known TrxNet peer IP tails; discovery remains passive.
+#ifdef FEATURE_NET
       int peers = net.peerCount();
       if (peers <= 0) { lcdPeerBrowseIdx = 0; break; }
       int v = (int)lcdPeerBrowseIdx + delta;
       if (v < 0) v = peers - 1;
       if (v >= peers) v = 0;
       lcdPeerBrowseIdx = (uint8_t)v;
+#endif
       break;
     }
     case 8:  // InterlockEnable 0 ↔ 1

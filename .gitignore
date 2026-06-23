@@ -1,0 +1,13 @@
+# Arduino IDE "export compiled binary" artifacts in the sketch root.
+# Use ./build.sh instead, which emits per-revision images under out/.
+/oi3.ino*.hex
+/oi3.ino*.elf
+/oi3.ino*.bin
+
+# arduino-cli / IDE build cache
+/build/
+
+# Keep only the release .hex images under out/ (drop .elf/.eep/.bin)
+out/**/*.elf
+out/**/*.eep
+out/**/*.bin
