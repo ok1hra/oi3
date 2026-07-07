@@ -215,9 +215,9 @@ AFSK from the PC, etc.) without ever lying about the rig's real state.
 
 ## Menu items
 
-23 items, indexed 0..22. Items 0..6 are read-only status; 7 is browse-
-only (peer list); 8..22 are editable settings. The mode cell on the
-right of row 0 is the same on every item.
+24 items, indexed 0..23. Items 0..6 and 23 are read-only status; 7 is
+browse-only (peer list); 8..22 are editable settings. The mode cell on
+the right of row 0 is the same on every item.
 
 | #  | Name          | Example display      | Editable | Range / values                  | Purpose |
 |----|---------------|----------------------|----------|---------------------------------|---------|
@@ -228,7 +228,7 @@ right of row 0 is the same on every item.
 | 4  | Baud (CAT)    | `baud 9600`          | no       | — (from cfg)                    | Serial2 baudrate used for CI-V. |
 | 5  | CI-V addr     | `CI-V 0x98`          | no       | — (from cfg)                    | Configured radio address (0x98=IC-7610, 0x56=IC-746). |
 | 6  | Frequency     | `14.074.0 kHz`       | no       | — / `---.---.- kHz`             | Live rig frequency, 100 Hz resolution. Placeholder while `!CivValid`. |
-| 7  | Peers         | `Peers 2` / `Peers off` | browse | EDITING = walk peer list       | Number of remote TrxNet peers, EDITING cycles through them showing `name .lastIP`. `off` = NET_ID=0 / no Eth. |
+| 7  | Peers         | `Peers 2` / `Peers off` | browse | EDITING = walk peer list       | Number of remote TrxNet peers, EDITING cycles through them showing `name .lastIP`. Priority peers (on `PriorityPrefixes`) show `*` instead of the `.` in the name (`705*01`). `off` = NET_ID=0 / no Eth. |
 | 8  | Interlock     | `Inter 1`            | yes (not persisted) | 0 ↔ 1                | `1` = D2 is PA safety interlock; `0` = D2 is external PTT-in. See [PTT, sequencer and interlock](#ptt-sequencer-and-interlock). |
 | 9  | SEQ lead      | `SeqH 0ms`           | yes (not persisted) | 0..9990 ms step 10   | Delay from SEQUENCER HIGH to PTTPA HIGH. |
 | 10 | PA lead       | `PAH 10ms`           | yes (not persisted) | 0..9990 ms step 10   | Delay from PTTPA HIGH to PTT1/2/3 HIGH. |
@@ -244,6 +244,7 @@ right of row 0 is the same on every item.
 | 20 | RTTY baud     | `RTY 45.45 Bd`       | yes      | 45, 50, 75, 100                 | FSK Baudot rate (45 stored as 45 but clocked at 45.45 Bd). |
 | 21 | FSK polarity  | `FSK N` / `FSK R`    | yes      | Normal ↔ Reverse                | Invert MARK/SPACE drive levels on the FSK pin. |
 | 22 | Debug         | `Debug off`          | yes (not persisted) | on ↔ off              | Enable verbose serial logging (`[CIV freq=…]`, `[PTT…]`, etc). Off by default; init banners and errors always print. |
+| 23 | UDP port      | `UDP 5683` / `no net` | no       | — (from cfg)                    | TrxNet UDP port (`UdpPort` in `oi3.cfg`). `no net` on boards without the network stack. |
 
 Items 16..21 are persisted to EEPROM on the EDITING→BROWSING transition.
 Items 7, 8..15 and 22 are intentionally **not** persisted — sequencer
@@ -570,6 +571,21 @@ remote stations are talking to you.
 until link is up and re-attempts `begin()` on link-up, so plugging the
 cable after boot works without a reset.
 
+**Priority peers:** the peer table holds a limited number of stations
+(8 on this board). When it fills, TrxNet evicts the *stalest* peer to
+make room for a newcomer. `PriorityPrefixes` in `oi3.cfg` (default
+`705 ANT ROT`) protects the stations that matter: any peer whose name
+starts with one of the listed prefixes (`705.01`, `ANT.01`, `ROT.1`, …)
+is never evicted for a non-priority newcomer. The list is a
+space-separated set of up to 6 prefixes (7 chars each); an empty value
+turns the protection off. Requires the TrxNet library ≥ 1.04. While
+browsing the peer list (menu item 7 EDITING), priority peers are shown
+with a `*` in place of the `.` in their name (`705*01`).
+
+All nodes must share the same **UDP port** (`UdpPort`, default `5683`) to
+see each other. Setting a different port on a group of nodes creates a
+second, isolated TrxNet network on the same LAN.
+
 ---
 
 ## Ethernet
@@ -628,12 +644,14 @@ Configuration keys (from `readSDSettings()`):
 | `CIV_CW_VIA_CIV`      | `0`         | 0 / 1                   | **Reserved / not implemented** — parsed but ignored; CW is always keyed locally via CW1/CW2 + sequencer. |
 | `EthernetEnable`      | `1`         | 0 / 1                   | Master Ethernet switch. |
 | `EthernetDHCP`        | `1`         | 0 / 1                   | 1 = DHCP, 0 = static. |
+| `UdpPort`             | `5683`      | 1..65535                | TrxNet UDP port. Change to run separate, isolated TrxNet networks on one LAN. Requires reset; out-of-range values keep the default. |
 | `KeyerDefaultWpm`     | `28`        | 5..50                   | Default WPM. EEPROM overrides if not `0xFF`. |
 | `KeyerMode`           | `B`         | `A` / `B`               | Iambic mode. |
 | `KeyerPaddleReverse`  | `0`         | 0 / 1                   | 1 = swap dit/dah paddles. |
 | `KeyerSidetoneHz`     | `600`       | 0 or 300..1200          | 0 = sidetone off. |
 | `KeyerRttyBaud`       | `45`        | 45 / 50 / 75 / 100      | 45 is clocked at 45.45 Bd. |
 | `KeyerFskReverse`     | `0`         | 0 / 1                   | 1 = invert MARK/SPACE polarity. |
+| `PriorityPrefixes`    | `705 ANT ROT` | space-sep list        | TrxNet peers kept when the peer table fills. Prefix-matched from the start of the device name (`705.01`/`ANT.01`/`ROT.1`); max 6 prefixes × 7 chars; empty = feature off. Requires TrxNet ≥ 1.04. |
 
 Cfg syntax — one key per line, both sides bracketed, free comment after
 the closing bracket:

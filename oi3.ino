@@ -1,5 +1,9 @@
 
-const char* REV = "20260626";
+const char* REV = "20260707";
+
+// $ ./build.sh
+// git commit -am "...
+
 
 // ===================== PCB REVISION =====================
 // Selects the pinout (and feature set) for the target PCB. Pass exactly one
@@ -199,6 +203,7 @@ byte          CIV_ADRESS      = 0x98;   // hex
 bool          CIV_CW_VIA_CIV  = false;  // RESERVED - parsed but unused; CW is always keyed locally
 bool          EthernetEnable  = true;
 bool          EthernetDHCP    = true;
+uint16_t      UdpPort         = 5683;   // TrxNet UDP port; change to isolate networks on one LAN
 // Keyer cfg (overridable from oi3.cfg; EEPROM may further override at boot)
 byte          KeyerDefaultWpm    = 28;     // 5..50
 char          KeyerMode          = 'B';    // 'A' or 'B' (iambic)
@@ -206,6 +211,13 @@ bool          KeyerPaddleReverse = false;  // false=PADDLEL is dit, true=swap (P
 uint16_t      KeyerSidetoneHz    = 600;    // 0=off, otherwise 300..1200
 byte          KeyerRttyBaud      = 45;     // 45 / 50 / 75 / 100 (45 => 45.45 Bd)
 bool          KeyerFskReverse    = false;  // false: MARK=HIGH/SPACE=LOW; true: inverted
+// TrxNet priority peer prefixes — protected from eviction when the peer table
+// fills. Prefix-matched from the start of the device name (705.01/ANT.01/ROT.1).
+// Caller-owned storage: must outlive net (globals). Default mirrors oi3.cfg.
+#define PRIO_MAX_COUNT 6
+#define PRIO_MAX_LEN   8            // 7 chars + null
+char          prioPrefix[PRIO_MAX_COUNT][PRIO_MAX_LEN] = { "705", "ANT", "ROT" };
+uint8_t       prioCount = 3;
 
 static unsigned char hexToDecBy4bit(unsigned char hex) {
   if (hex > 0x39) hex -= 7;
@@ -255,6 +267,8 @@ void readSDSettings() {
       else if (settingName == "CIV_CW_VIA_CIV")  CIV_CW_VIA_CIV = (bool)settingValue.toInt();
       else if (settingName == "EthernetEnable")  EthernetEnable = (bool)settingValue.toInt();
       else if (settingName == "EthernetDHCP")    EthernetDHCP = (bool)settingValue.toInt();
+      else if (settingName == "UdpPort")         { long p = settingValue.toInt();
+                                                   if (p >= 1 && p <= 65535) UdpPort = (uint16_t)p; }
       else if (settingName == "KeyerDefaultWpm") KeyerDefaultWpm = (byte)settingValue.toInt();
       else if (settingName == "KeyerMode")       { char c = settingValue.length() > 0 ? settingValue.charAt(0) : 'B';
                                                    if (c >= 'a' && c <= 'z') c -= 32;
@@ -263,6 +277,25 @@ void readSDSettings() {
       else if (settingName == "KeyerSidetoneHz") KeyerSidetoneHz = (uint16_t)settingValue.toInt();
       else if (settingName == "KeyerRttyBaud")   KeyerRttyBaud = (byte)settingValue.toInt();
       else if (settingName == "KeyerFskReverse") KeyerFskReverse = (bool)settingValue.toInt();
+      else if (settingName == "PriorityPrefixes") {
+        // Replace (not extend) the compiled default. Split on spaces, skip
+        // empty tokens, truncate to PRIO_MAX_LEN-1 chars, cap at PRIO_MAX_COUNT.
+        prioCount = 0;
+        int len = settingValue.length();
+        int i = 0;
+        while (i < len && prioCount < PRIO_MAX_COUNT) {
+          while (i < len && settingValue.charAt(i) == ' ') i++;   // skip spaces
+          int start = i;
+          while (i < len && settingValue.charAt(i) != ' ') i++;   // token span
+          int n = i - start;
+          if (n > 0) {
+            if (n > PRIO_MAX_LEN - 1) n = PRIO_MAX_LEN - 1;
+            for (int k = 0; k < n; k++) prioPrefix[prioCount][k] = settingValue.charAt(start + k);
+            prioPrefix[prioCount][n] = '\0';
+            prioCount++;
+          }
+        }
+      }
 
       settingName = "";
       settingValue = "";
@@ -695,11 +728,12 @@ bool        trxNetStarted = false;
 #ifdef FEATURE_NET
 #include <TrxNet.h>
 
-const uint16_t TRXNET_PORT = 5683;
-
 EthernetUDP trxUdp;
 TrxNet      net(trxUdp);
 char        trxDeviceName[TRXNET_MAX_DEVICE_NAME];
+// Pointer array handed to net.setPriorityPrefixes(); net keeps this pointer, so
+// the array (and the prioPrefix[] it points into) must live for net's lifetime.
+const char* prioPtr[PRIO_MAX_COUNT];
 
 volatile uint32_t trxPendingHz   = 0;
 volatile uint8_t  trxPendingMode = 0;     // CI-V mode byte
@@ -766,12 +800,16 @@ void trxnet_loop() {
   if (NET_ID != 0x00 && EthernetEnable && EthModulePresent && EthLinkStatus) {
     if (!trxNetStarted) {
       snprintf(trxDeviceName, sizeof(trxDeviceName), "OI3.%02x", NET_ID);
-      net.setPort(TRXNET_PORT);
+      net.setPort(UdpPort);
       net.onPeerAdded(onPeerJoined);   // must be set BEFORE begin()
       net.begin(trxDeviceName);
       net.subscribe("/s-hz",   onSetHz);
       net.subscribe("/s-mode", onSetMode);
       net.subscribe("/s-cw",   onSetCw);
+#if TRXNET_VERSION >= 0x0104
+      for (uint8_t i = 0; i < prioCount; i++) prioPtr[i] = prioPrefix[i];
+      net.setPriorityPrefixes(prioCount ? prioPtr : nullptr, prioCount);
+#endif
       trxNetStarted = true;
       Serial.print(F("TrxNet begin: "));
       Serial.println(trxDeviceName);
@@ -1792,7 +1830,7 @@ void keyer_loop() {
 // (see KEYER block) — saved by lcd_edit_save().
 #include <EEPROM.h>
 
-const uint8_t LCD_MENU_ITEM_COUNT = 23;
+const uint8_t LCD_MENU_ITEM_COUNT = 24;
 const uint8_t LCD_VALUE_WIDTH     = 12;
 const uint8_t LCD_MODE_WIDTH      = 3;
 const uint8_t LCD_SEP_COL         = 12;
@@ -1856,6 +1894,18 @@ static void lcd_pad_left_align(const char* src, char* out, uint8_t width) {
   for (uint8_t i = len; i < width; i++) out[i] = ' ';
   out[width] = 0;
 }
+
+#ifdef FEATURE_NET
+// True if a peer name matches a configured priority prefix — same strncmp
+// semantics as TrxNet::setPriorityPrefixes(). prioCount==0 (feature off) → false.
+static bool lcd_peer_is_priority(const char* name) {
+  for (uint8_t i = 0; i < prioCount; i++) {
+    size_t n = strlen(prioPrefix[i]);
+    if (n && strncmp(name, prioPrefix[i], n) == 0) return true;
+  }
+  return false;
+}
+#endif
 
 // In BROWSING/EDITING, editable items render '=' between name and value instead
 // of a space — a visual hint that long-press SET enters EDITING. Read-only
@@ -1923,8 +1973,19 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
         if (lcdPeerBrowseIdx >= (uint8_t)peers) lcdPeerBrowseIdx = 0;
         if (state == LCD_EDITING) {
           const TrxPeer* peer = net.peer(lcdPeerBrowseIdx);
-          if (peer) snprintf(raw, sizeof(raw), "%.7s .%u", peer->name, peer->ip[3]);
-          else      snprintf(raw, sizeof(raw), "P?/%u", peers);
+          if (peer) {
+            // Priority peers show '*' instead of '.' in the name (705*01) so the
+            // protected devices stand out while browsing the peer list.
+            char pn[8];
+            snprintf(pn, sizeof(pn), "%.7s", peer->name);
+            if (lcd_peer_is_priority(peer->name)) {
+              char* dot = strchr(pn, '.');
+              if (dot) *dot = '*';
+            }
+            snprintf(raw, sizeof(raw), "%s .%u", pn, peer->ip[3]);
+          } else {
+            snprintf(raw, sizeof(raw), "P?/%u", peers);
+          }
         } else {
           snprintf(raw, sizeof(raw), "Peers%c%d", s, peers);
         }
@@ -1991,6 +2052,13 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
       break;
     case 22:  // serial debug toggle (not persisted)
       snprintf(raw, sizeof(raw), "Debug%c%s", s, serialDebug ? "on" : "off");
+      break;
+    case 23:  // TrxNet UDP port (read-only; set in oi3.cfg)
+#ifdef FEATURE_NET
+      snprintf(raw, sizeof(raw), "UDP %u", UdpPort);
+#else
+      strcpy(raw, "no net");
+#endif
       break;
     default:
       strcpy(raw, "?");
