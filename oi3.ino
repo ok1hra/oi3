@@ -1,5 +1,5 @@
 
-const char* REV = "20260707";
+const char* REV = "20260710";
 
 // $ ./build.sh
 // git commit -am "...
@@ -211,6 +211,14 @@ bool          KeyerPaddleReverse = false;  // false=PADDLEL is dit, true=swap (P
 uint16_t      KeyerSidetoneHz    = 600;    // 0=off, otherwise 300..1200
 byte          KeyerRttyBaud      = 45;     // 45 / 50 / 75 / 100 (45 => 45.45 Bd)
 bool          KeyerFskReverse    = false;  // false: MARK=HIGH/SPACE=LOW; true: inverted
+// Low-power TUNE cfg — MODE button (D36) while CivValid keys a low-power carrier
+// for antenna-tuner / PA tuning on one click (see LOW-POWER TUNE section).
+byte          TunePower           = 20;    // ladicí výkon [%], → CI-V 14 0A
+byte          TuneRestoreFallback = 100;   // [%] obnova, když startovní read výkonu selže
+uint16_t      TuneHoldMs          = 1000;  // min. doba nosné i na krátké ťuknutí
+uint16_t      TuneMaxMs           = 30000; // tvrdý strop nosné (ochrana proti zaseklému tlačítku)
+uint16_t      TuneSettleMs        = 80;    // prodleva po set mód+výkon, než jde PTT nahoru
+uint16_t      TuneReadTimeoutMs   = 300;   // timeout jednoho pokusu o čtení výkonu
 // TrxNet priority peer prefixes — protected from eviction when the peer table
 // fills. Prefix-matched from the start of the device name (705.01/ANT.01/ROT.1).
 // Caller-owned storage: must outlive net (globals). Default mirrors oi3.cfg.
@@ -277,6 +285,12 @@ void readSDSettings() {
       else if (settingName == "KeyerSidetoneHz") KeyerSidetoneHz = (uint16_t)settingValue.toInt();
       else if (settingName == "KeyerRttyBaud")   KeyerRttyBaud = (byte)settingValue.toInt();
       else if (settingName == "KeyerFskReverse") KeyerFskReverse = (bool)settingValue.toInt();
+      else if (settingName == "TunePower")           TunePower = (byte)settingValue.toInt();
+      else if (settingName == "TuneRestoreFallback") TuneRestoreFallback = (byte)settingValue.toInt();
+      else if (settingName == "TuneHoldMs")          TuneHoldMs = (uint16_t)settingValue.toInt();
+      else if (settingName == "TuneMaxMs")           TuneMaxMs = (uint16_t)settingValue.toInt();
+      else if (settingName == "TuneSettleMs")        TuneSettleMs = (uint16_t)settingValue.toInt();
+      else if (settingName == "TuneReadTimeoutMs")   TuneReadTimeoutMs = (uint16_t)settingValue.toInt();
       else if (settingName == "PriorityPrefixes") {
         // Replace (not extend) the compiled default. Split on spaces, skip
         // empty tokens, truncate to PRIO_MAX_LEN-1 chars, cap at PRIO_MAX_COUNT.
@@ -512,6 +526,7 @@ unsigned long CivFreq  = 0;       // Hz, last parsed frequency
 // Boot default = CW (0x03). When CI-V is silent (!CivValid) the MODE button
 // rotates this locally; once rig data arrives, broadcasts overwrite it.
 uint8_t       CivMode  = 0x03;    // raw CI-V mode byte
+uint8_t       CivFilter = 0x01;   // last parsed IF filter (1=FIL1,2=FIL2,3=FIL3)
 bool          CivValid = false;
 
 static unsigned long civLastPollMs       = 0;
@@ -571,7 +586,10 @@ void civ_send_setfreq(uint32_t hz) {
   civ_request_fast_poll(10000);
 }
 
-void civ_send_setmode(uint8_t civmode) {
+// Set mode with explicit IF filter (flt 1..3). civ_send_setmode() keeps the old
+// behaviour (FIL1) for callers that don't track the filter.
+void civ_send_setmode_flt(uint8_t civmode, uint8_t flt) {
+  if (flt < 1 || flt > 3) flt = 1;      // sanitize: a bad filter byte would NAK
   if (CIV_ADRESS == 0x98) civ_send_main_band_select();
   Serial2.write((uint8_t)0xFE);
   Serial2.write((uint8_t)0xFE);
@@ -579,10 +597,87 @@ void civ_send_setmode(uint8_t civmode) {
   Serial2.write((uint8_t)CIV_OWN_ADDRESS);
   Serial2.write((uint8_t)0x06);
   Serial2.write(civmode);
-  Serial2.write((uint8_t)0x01);
+  Serial2.write(flt);
   Serial2.write((uint8_t)0xFD);
   Serial2.flush();
   civ_request_fast_poll(10000);
+}
+
+void civ_send_setmode(uint8_t civmode) {
+  civ_send_setmode_flt(civmode, 0x01);
+}
+
+// ----- RF power (cmd 14 0A) -----
+// CI-V RF power is a 2-byte BCD value 00 00..02 55 (0..255) = 0..100 %.
+// Percent → raw (0..255), rounded to nearest.
+static uint8_t civ_power_pct_to_raw(uint8_t pct) {
+  if (pct > 100) pct = 100;
+  return (uint8_t)(((uint16_t)pct * 255 + 50) / 100);
+}
+
+// Set RF power. raw (0..255) → d1 = hundreds BCD digit, d2 = tens/units BCD.
+void civ_send_set_power(uint8_t raw) {
+  uint8_t d1 = raw / 100;                                // 0..2
+  uint8_t d2 = (uint8_t)((((raw / 10) % 10) << 4) | (raw % 10));
+  Serial2.write((uint8_t)0xFE);
+  Serial2.write((uint8_t)0xFE);
+  Serial2.write((uint8_t)CIV_ADRESS);
+  Serial2.write((uint8_t)CIV_OWN_ADDRESS);
+  Serial2.write((uint8_t)0x14);
+  Serial2.write((uint8_t)0x0A);
+  Serial2.write(d1);
+  Serial2.write(d2);
+  Serial2.write((uint8_t)0xFD);
+  Serial2.flush();
+}
+
+// Blocking read of RF power (cmd 14 0A). Returns true and sets *raw (0..255) on
+// a valid reply within timeoutMs (retried up to `retries` extra times).
+// Pumps net/ptt loops while waiting but NOT civ_loop() — so the reply bytes stay
+// for this parser instead of being consumed by the periodic sniffer. Intended to
+// run only inside the exclusive TUNE action (background polling paused anyway).
+bool civ_read_power_blocking(uint8_t* raw, uint16_t timeoutMs, uint8_t retries) {
+  for (uint8_t attempt = 0; attempt <= retries; attempt++) {
+    while (Serial2.available() > 0) Serial2.read();      // flush stale RX
+    // request: FE FE <radio> <us> 14 0A FD
+    Serial2.write((uint8_t)0xFE); Serial2.write((uint8_t)0xFE);
+    Serial2.write((uint8_t)CIV_ADRESS); Serial2.write((uint8_t)CIV_OWN_ADDRESS);
+    Serial2.write((uint8_t)0x14); Serial2.write((uint8_t)0x0A);
+    Serial2.write((uint8_t)0xFD);
+    Serial2.flush();
+
+    uint8_t sm = 0, d1 = 0, d2 = 0;
+    unsigned long t0 = millis();
+    while ((millis() - t0) < timeoutMs) {
+      ethernet_loop(); trxnet_loop(); ptt_loop();
+      while (Serial2.available() > 0) {
+        uint8_t b = (uint8_t)Serial2.read();
+        switch (sm) {
+          case 0: sm = (b == 0xFE) ? 1 : 0; break;
+          case 1: sm = (b == 0xFE) ? 2 : 0; break;
+          case 2: // to-addr = our controller (0x0E), or 0xE0; extra FE stays
+                  if      (b == CIV_OWN_ADDRESS || b == 0xE0) sm = 3;
+                  else if (b == 0xFE)                         sm = 2;
+                  else                                        sm = 0; break;
+          case 3: sm = (b == CIV_ADRESS) ? 4 : (b == 0xFE ? 1 : 0); break;
+          case 4: sm = (b == 0x14) ? 5 : (b == 0xFE ? 1 : 0); break;
+          case 5: sm = (b == 0x0A) ? 6 : (b == 0xFE ? 1 : 0); break;
+          case 6: d1 = b; sm = 7; break;
+          case 7: d2 = b; sm = 8; break;
+          case 8:
+            if (b == 0xFD) {
+              uint16_t v = (uint16_t)(((d1 >> 4) * 10 + (d1 & 0x0F)) * 100
+                                    + ((d2 >> 4) * 10 + (d2 & 0x0F)));
+              if (v > 255) v = 255;
+              *raw = (uint8_t)v;
+              return true;
+            }
+            sm = (b == 0xFE) ? 1 : 0; break;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 // CI-V freq is 5 BCD bytes, LSB-first. Each byte's high nibble is the more
@@ -686,6 +781,7 @@ void civ_loop() {
     // mode frame complete
     else if (civRd[4] == 0x04 && civRd[7] == 0xFD) {
       uint8_t m = civRd[5];
+      CivFilter = civRd[6];              // track IF filter so it can be restored
       civLastParseMs = millis();
       civRd[7] = 0;
       civRd[4] = 0;
@@ -870,6 +966,10 @@ byte          ptt_interlock_active = 0;
 // cannot clobber a PTT the keyer is holding between elements. Written only by
 // the KEYER block (begin_tx / tail_service / abort), read here.
 bool          keyerPttRequest      = false;
+// Low-power TUNE PTT source — held true by tune_run() while the tuning carrier is
+// on the air. ORed into ptt_inputs_poll() like keyerPttRequest so the level poll
+// cannot drop PTT under the tune. Written only by the LOW-POWER TUNE section.
+bool          tunePttRequest       = false;
 byte          PttOut               = 3;        // current selected PTT output 1/2/3
 unsigned long LastSeqChange        = 0;
 
@@ -993,7 +1093,7 @@ static void ptt_inputs_poll() {
   // keyerPttRequest is the CW/RTTY keyer's source: without it, this level-based
   // poll would reset PttActive to false on every iteration while the keyer is
   // mid-element (none of the HW inputs are active for paddle-driven keying).
-  ptt_request(footSwTx || ptt232Tx || ilInTx || keyerPttRequest);
+  ptt_request(footSwTx || ptt232Tx || ilInTx || keyerPttRequest || tunePttRequest);
 }
 
 void ptt_setup() {
@@ -1787,6 +1887,157 @@ void keyer_loop() {
 // =================== END KEYER ===================
 
 
+// ===================== LOW-POWER TUNE =====================
+// MODE button (D36) while CI-V is active (CivValid) keys a low-power carrier for
+// antenna-tuner / PA tuning on one click. When CI-V is silent the same button
+// still rotates CivMode (handled in the LCD MODE handler).
+//
+// Sequence (blocking, pumps net/ptt loops in the same house style as the keyer's
+// keyer_begin_tx_wait_sequencer()). Because civ_loop() is not called for the
+// duration, the periodic freq/mode poll is paused automatically and the bus is
+// exclusively ours for the read / set / restore frames:
+//   1) read current RF power (retry) → save; on failure use TuneRestoreFallback
+//      as the restore target and warn. Save current mode (CivMode cache == rig).
+//   2) CI-V set mode CW (06 03 01); cache CivMode=CW so the sequencer picks the
+//      CW PTT output relay.
+//   3) CI-V set power = TunePower %.
+//   4) settle TuneSettleMs (let the rig apply mode+power before RF).
+//   5) sequencer PTT up (SEQ→PA→PTT123), then key CW1/CW2 solid = carrier.
+//   6) hold: at least TuneHoldMs (so a quick tap still gives a full tune pulse),
+//      then until MODE is released.
+//   7) CW up → sequencer PTT down (tail).
+//   8) restore power then mode (best-effort — runs on every exit incl. abort).
+// Abort (interlock, PTT-up timeout) jumps straight to step 7/8 so the rig is
+// never left silently at low power / in CW.
+static const uint8_t  TUNE_CW_MODE     = 0x03;   // CI-V mode byte for CW carrier
+
+// TX-idle guard: a tune may start only when nothing else is transmitting.
+static bool tune_tx_idle() {
+  if (!CivValid)                        return false;   // feature is CI-V-only
+  if (SequencerLevel != 0 || PttActive) return false;   // sequencer must be down
+  if (keyerState != KEYER_IDLE)         return false;   // keyer not mid-send
+  if (keyerPttRequest || tunePttRequest)return false;
+  if (ptt_interlock_active)             return false;
+  if (digitalRead(FootSW) == LOW)       return false;   // external PTT (footsw)
+  if (digitalRead(PTT232) == HIGH)      return false;   // external PTT (232)
+  if (keyer_paddle_dit_pressed() || keyer_paddle_dah_pressed()) return false;
+  return true;
+}
+
+// Request PTT and pump until the sequencer has brought up PTT123 (+PTTlead
+// settle). Returns false on interlock / timeout. Keeps CivValid fresh.
+// Caller must have set CivMode so ptt_output_for_civmode() picks the wanted relay.
+static bool tune_wait_ptt_up() {
+  tunePttRequest = true;              // ORed in by ptt_inputs_poll → sequencer up
+  ptt_request(true);                  // set PttActive/PttOut now (mirrors keyer)
+  unsigned long t0 = millis();
+  while (SequencerLevel != PttOut) {
+    ethernet_loop(); trxnet_loop(); ptt_loop();
+    civLastParseMs = millis();
+    if (ptt_interlock_active)    return false;
+    if ((millis() - t0) > 2000)  return false;   // safety
+  }
+  unsigned long tl = millis();
+  while ((millis() - tl) < (unsigned long)PTTlead) {
+    ptt_loop();
+    if (ptt_interlock_active || SequencerLevel != PttOut) return false;
+  }
+  return true;
+}
+
+// Drop the tune PTT source and pump until the sequencer is fully down (level 0).
+static void tune_wait_ptt_down() {
+  tunePttRequest = false;
+  unsigned long t0 = millis();
+  while (SequencerLevel != 0) {
+    ethernet_loop(); trxnet_loop(); ptt_loop();
+    civLastParseMs = millis();
+    if (ptt_interlock_active)   break;            // interlock already forced down
+    if ((millis() - t0) > 3000) break;            // safety
+  }
+}
+
+static void tune_lcd_show() {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "TUNE %u%%", TunePower);
+  keyerRow1Locked = true;
+  lcd.setCursor(0, 1);
+  lcd.print(F("                "));
+  lcd.setCursor(0, 1);
+  lcd.print(buf);
+}
+
+// Full blocking tune action. Precondition: tune_tx_idle() && CivValid.
+static void tune_run() {
+  // --- 1) read + save current power / mode ---
+  uint8_t savedRaw;
+  bool haveSaved = civ_read_power_blocking(&savedRaw, TuneReadTimeoutMs, 2);
+  if (!haveSaved) {
+    savedRaw = civ_power_pct_to_raw(TuneRestoreFallback);  // fallback restore target
+    tone(TONE, 300, 120); delay(140); tone(TONE, 300, 120); delay(140);  // warble
+  }
+  uint8_t savedMode   = CivMode;
+  uint8_t savedFilter = CivFilter;        // preserve IF filter (FIL1/2/3) across the tune
+
+  // --- 2) force CW mode (FIL1 during tune is irrelevant; restored at the end) ---
+  civ_send_setmode(TUNE_CW_MODE);
+  CivMode = TUNE_CW_MODE;                 // cache → sequencer picks CW PTT relay
+
+  // --- 3) set low power ---
+  civ_send_set_power(civ_power_pct_to_raw(TunePower));
+
+  // --- 4) settle, then LCD feedback ---
+  unsigned long ts = millis();
+  while ((millis() - ts) < (unsigned long)TuneSettleMs) { ethernet_loop(); trxnet_loop(); ptt_loop(); }
+  tune_lcd_show();
+
+  // --- 5) PTT up, then solid carrier ---
+  bool keyed = false;
+  if (tune_wait_ptt_up()) {
+    keyed = true;
+    digitalWrite(CW1, HIGH);              // solid carrier (rig provides its own sidetone)
+    digitalWrite(CW2, HIGH);
+
+    // --- 6) hold: min TuneHoldMs, then until MODE released; hard cap TuneMaxMs ---
+    unsigned long tStart = millis();
+    for (;;) {
+      ethernet_loop(); trxnet_loop(); ptt_loop();
+      civLastParseMs = millis();
+      if (ptt_interlock_active) break;                     // abort on interlock
+      unsigned long elapsed = millis() - tStart;
+      bool held = (digitalRead(MENU) == LOW);
+      if (!held && elapsed >= (unsigned long)TuneHoldMs) break;   // released after min hold
+      if (elapsed >= (unsigned long)TuneMaxMs) {                  // stuck-button safety cap
+        tone(TONE, 200, 200);
+        break;
+      }
+    }
+  }
+
+  // --- 7) carrier off, PTT down ---
+  if (keyed) {
+    digitalWrite(CW1, LOW);
+    digitalWrite(CW2, LOW);
+  }
+  tune_wait_ptt_down();
+
+  // --- 8) restore power then mode+filter (best-effort, always runs) ---
+  civ_send_set_power(savedRaw);
+  civ_send_setmode_flt(savedMode, savedFilter);
+  CivMode   = savedMode;
+  CivFilter = savedFilter;
+  civLastParseMs = millis();              // don't let the watchdog fire post-tune
+  tone(TONE, 600, 60);                    // restore-confirm blip
+
+  // hand row 1 back to the keyer
+  lcd.setCursor(0, 1);
+  lcd.print(F("                "));
+  keyerLcdTxCol   = 0;
+  keyerRow1Locked = false;
+}
+// =================== END LOW-POWER TUNE ===================
+
+
 // ===================== LCD RUNTIME =====================
 // Row-0 renderer running after setup(). Layout: HHHHHHHHHHHH|MMM
 // (12-wide value + separator + 3-char mode).
@@ -1801,9 +2052,10 @@ void keyer_loop() {
 //   long  press in BROWSING → EDITING  (if item editable; fires on threshold)
 //   any  press  in EDITING  → BROWSING with save (write EEPROM; no cancel path)
 //   BROWSING auto-timeout → PINNED after 30 s of no panel activity
-// MODE button (D36): rotates CivMode LSB→USB→AM→CW→RTY→FM→CWR→RTR→LSB on every
-// press, but only while !CivValid (rig silent). When CI-V is reading mode from
-// the rig, MODE is inactive (rig is source of truth). Boot init = CW.
+// MODE button (D36): while !CivValid (rig silent) rotates CivMode
+// LSB→USB→AM→CW→RTY→FM→CWR→RTR→LSB on every press (boot init = CW). While
+// CivValid (rig on CI-V) a press instead fires the low-power TUNE action (see
+// LOW-POWER TUNE section) when TX is idle, else a refuse beep.
 // Menu items 0..6:   read-only (call/FW/IP/baud/CIV/freq).
 // Menu item 7:       peer count; long-press SET browses known peer IP tails.
 // Menu items 8..14:  editable sequencer settings in runtime order (not persisted).
@@ -2415,13 +2667,21 @@ void lcd_loop() {
 
   lcdBtnPrev = btnNow;
 
-  // --- MODE button: cycle CivMode when !CivValid (rig silent) ---
+  // --- MODE button: !CivValid → cycle CivMode; CivValid → low-power TUNE ---
+  // Sampled once per LCD tick (~30 ms), which also debounces the press edge.
   bool modeDownNow = (digitalRead(MENU) == LOW);
   if (modeDownNow && !lcdModeDown) {
     lcdModeDown = true;
     if (lcdState == LCD_BROWSING) lcdBrowsingActivityMs = now;
-    if (!CivValid) civ_mode_cycle_next();
-    // Active CI-V → press ignored (rig is source of truth for mode)
+    if (!CivValid) {
+      civ_mode_cycle_next();          // rig silent → local mode rotation
+    } else if (tune_tx_idle()) {
+      tune_run();                     // rig active → exclusive blocking tune
+    } else {
+      tone(TONE, 200, 120);           // refused: something else is transmitting
+    }
+    // After tune_run() the button has been released (or aborted): the release
+    // edge below clears lcdModeDown, and re-entry is blocked until then.
   } else if (!modeDownNow && lcdModeDown) {
     lcdModeDown = false;
   }
