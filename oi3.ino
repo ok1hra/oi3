@@ -1,5 +1,5 @@
 
-const char* REV = "20260710";
+const char* REV = "20260711";
 
 // $ ./build.sh
 // git commit -am "...
@@ -972,6 +972,11 @@ bool          keyerPttRequest      = false;
 bool          tunePttRequest       = false;
 byte          PttOut               = 3;        // current selected PTT output 1/2/3
 unsigned long LastSeqChange        = 0;
+// Global PTT-output enable. false = the sequencer asserts NO output (PTT123 / PA /
+// SEQ) from ANY source and the keyer keys CW/FSK directly without waiting on the
+// sequencer (rig break-in brings itself into TX). Toggled via LCD menu item 24;
+// always true after reboot (not persisted, no cfg override).
+bool          PttOutputEnable      = true;
 
 byte ptt_output_for_civmode() {
   // Fallback is range-checked too: a bad PTTmodeDefault (from cfg/SD) must never
@@ -1093,7 +1098,11 @@ static void ptt_inputs_poll() {
   // keyerPttRequest is the CW/RTTY keyer's source: without it, this level-based
   // poll would reset PttActive to false on every iteration while the keyer is
   // mid-element (none of the HW inputs are active for paddle-driven keying).
-  ptt_request(footSwTx || ptt232Tx || ilInTx || keyerPttRequest || tunePttRequest);
+  // PttOutputEnable=false (LCD item 24) globally suppresses every source, so
+  // PttActive stays false and the sequencer never leaves level 0 — no PTT123 / PA
+  // / SEQ output. CW/FSK keying is unaffected (the keyer bypasses the gate below).
+  ptt_request(PttOutputEnable
+              && (footSwTx || ptt232Tx || ilInTx || keyerPttRequest || tunePttRequest));
 }
 
 void ptt_setup() {
@@ -1508,6 +1517,11 @@ static void keyer_wait_us_pump(unsigned long us) {
 // (sidetone + key) only fires once the sequencer has brought up SEQ + PA + PTT123.
 // Returns false on abort/timeout.
 static bool keyer_begin_tx_wait_sequencer() {
+  // PTT output disabled (LCD item 24): key CW/FSK directly — no PTT123 / PA / SEQ
+  // and no sequencer wait; the rig's break-in brings itself into TX. Don't assert
+  // keyerPttRequest, so ptt_inputs_poll() keeps the sequencer down.
+  if (!PttOutputEnable) return true;
+
   // Assert the keyer's own PTT source first, so ptt_inputs_poll() (called from
   // ptt_loop() below) keeps PttActive=true instead of resetting it from the HW
   // inputs every poll. On any failure path, drop it again so a stuck request
@@ -1735,7 +1749,10 @@ static void keyer_send_buffer_drain() {
 // PTT up between consecutive chars / paddle elements but releases promptly when
 // transmission stops.
 static void keyer_ptt_tail_service() {
-  if (!PttActive) return;
+  // Normally gated on an active PTT. With PTT output disabled we never asserted
+  // PttActive, but an RTTY session still drove the FSK line, so it must still be
+  // released after the hang time — run the tail logic in that case too.
+  if (!PttActive && PttOutputEnable) return;
   if (keyerSendHead != keyerSendTail) return;
   if (keyerDitBuf || keyerDahBuf) return;
   if (keyer_paddle_dit_pressed() || keyer_paddle_dah_pressed()) return;
@@ -1914,6 +1931,7 @@ static const uint8_t  TUNE_CW_MODE     = 0x03;   // CI-V mode byte for CW carrie
 // TX-idle guard: a tune may start only when nothing else is transmitting.
 static bool tune_tx_idle() {
   if (!CivValid)                        return false;   // feature is CI-V-only
+  if (!PttOutputEnable)                 return false;   // PTT output disabled (LCD item 24)
   if (SequencerLevel != 0 || PttActive) return false;   // sequencer must be down
   if (keyerState != KEYER_IDLE)         return false;   // keyer not mid-send
   if (keyerPttRequest || tunePttRequest)return false;
@@ -2066,6 +2084,10 @@ static void tune_run() {
 //                    lcd_format_value case 15).
 // Menu items 16..21: editable keyer settings (WPM/Mode/Pad/Sidetone/Bd/FSK).
 // Menu item 22:      editable serial debug toggle (not persisted).
+// Menu item 23:      read-only TrxNet UDP port (set in oi3.cfg).
+// Menu item 24:      editable PTT-output enable (PTTout on/off). off = no PTT123 /
+//                    PA / SEQ from any source; CW/FSK keep keying. Not persisted —
+//                    always on after reboot (PttOutputEnable).
 // Auto-repeat: 700 ms hold → 3 Hz. Active only in PINNED (WPM ±) and EDITING
 // (value dec/inc). BROWSING navigation is edge-only — one menu step per press.
 // Tones: only on BROWSING↔EDITING transition (low→high entering, high→low
@@ -2082,7 +2104,7 @@ static void tune_run() {
 // (see KEYER block) — saved by lcd_edit_save().
 #include <EEPROM.h>
 
-const uint8_t LCD_MENU_ITEM_COUNT = 24;
+const uint8_t LCD_MENU_ITEM_COUNT = 25;
 const uint8_t LCD_VALUE_WIDTH     = 12;
 const uint8_t LCD_MODE_WIDTH      = 3;
 const uint8_t LCD_SEP_COL         = 12;
@@ -2312,6 +2334,9 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
       strcpy(raw, "no net");
 #endif
       break;
+    case 24:  // PTT output enable (not persisted — always on after reboot)
+      snprintf(raw, sizeof(raw), "PTTout%c%s", s, PttOutputEnable ? "on" : "off");
+      break;
     default:
       strcpy(raw, "?");
       break;
@@ -2413,7 +2438,7 @@ static void lcd_row1_overlay_wpm() {
 // ----- Editable-item helpers -----
 
 static bool lcd_item_is_editable(uint8_t idx) {
-  return idx == 7 || (idx >= 8 && idx <= 22);
+  return idx == 7 || (idx >= 8 && idx <= 22) || idx == 24;
 }
 
 static void lcd_edit_ms_value(int* value, int delta) {
@@ -2512,6 +2537,9 @@ static void lcd_edit_step(int delta) {
     case 22:  // Serial debug on ↔ off toggle
       serialDebug = !serialDebug;
       break;
+    case 24:  // PTT output enable on ↔ off (not persisted; always on after reboot)
+      PttOutputEnable = !PttOutputEnable;
+      break;
   }
 }
 
@@ -2562,6 +2590,11 @@ static void lcd_edit_save() {
     case 22: // serial debug not persisted; announce state-change unconditionally
              Serial.print(F("[Debug "));
              Serial.print(serialDebug ? F("ON") : F("OFF"));
+             Serial.println(']');
+             break;
+    case 24: // PTT output enable not persisted; announce state-change
+             Serial.print(F("[PTTout "));
+             Serial.print(PttOutputEnable ? F("ON") : F("OFF"));
              Serial.println(']');
              break;
   }
