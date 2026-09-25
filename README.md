@@ -546,6 +546,7 @@ and discovers peers on the LAN.
 |---------|--------------------------|--------------------------|
 | `/hz`   | `uint32_t` Hz            | On every CivFreq change  |
 | `/mode` | `uint8_t` CIV mode byte  | On every CivMode change  |
+| `/lptune` | `uint8_t` state        | Low-power TUNE state: `0` idle (restored), `1` carrier up, `2` refused, `3` aborted |
 
 **Topics subscribed by OI3 (peers can drive us):**
 
@@ -555,11 +556,27 @@ and discovers peers on the LAN.
 | `/s-mode` | `uint8_t` mode   | Set rig mode via CI-V. |
 | `/s-cw`   | ASCII bytes      | Enqueue for CW or RTTY send (see Keyer). |
 | `/s-cw`   | `0x03` or `0xFF` | Abort current CW/RTTY send and flush buffer. |
+| `/s-lptune` | `uint8_t` `1` / `2` / `0` / `3` | Low-power TUNE: `1` start, `2` keepalive, `0` stop, `3` query state (see below). |
 
 When a new peer joins, OI3 sends it a CON snapshot of its current
-`/hz` and `/mode` — but only after CI-V is known (i.e. either the rig
+`/hz`, `/mode` and `/lptune` — but only after CI-V is known (i.e. either the rig
 has answered at least once, or the local fallback has been set). The
 greeting queue is drained one peer per loop iteration to avoid bursts.
+
+**Low-power TUNE over TrxNet:** `/s-lptune 1` runs the same action as the
+MODE button while CI-V is live — CW mode, `TunePower` %, sequencer PTT up,
+solid carrier on CW1/CW2, then power, mode and filter restored — for a peer
+that tunes an amplifier (the WIFILT PA palette's TUNE+). The carrier stays up
+until `/s-lptune 0`, but only while `/s-lptune 2` keepalives keep arriving:
+none for `TuneKeepaliveMs` (default 2500 ms) and it drops, so a peer that
+crashed cannot leave the rig keyed. `TuneMaxMs` still caps it. A keepalive
+never starts a tune — one still in flight after an abort must not key the
+rig again. `/lptune` reports progress; `2` means the start was refused because
+something else was transmitting (same rule as the MODE button). While the tune
+runs, `/s-hz` and `/s-mode` are held and applied after the restore, and `/s-cw`
+text is dropped rather than sent after the carrier. The `/lptune` greeting — or
+the answer to `/s-lptune 3`, for a peer that restarted and so got no greeting —
+is how a peer learns this firmware supports it.
 
 Menu item 7 shows the live peer count. Long-press SET in BROWSING on
 item 7 enters a special "browse" mode where DWN/UP walk the peer list

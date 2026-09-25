@@ -1,5 +1,5 @@
 
-const char* REV = "20260711";
+const char* REV = "20260925";
 
 // $ ./build.sh
 // git commit -am "...
@@ -219,6 +219,7 @@ uint16_t      TuneHoldMs          = 1000;  // min. doba nosné i na krátké ťu
 uint16_t      TuneMaxMs           = 30000; // tvrdý strop nosné (ochrana proti zaseklému tlačítku)
 uint16_t      TuneSettleMs        = 80;    // prodleva po set mód+výkon, než jde PTT nahoru
 uint16_t      TuneReadTimeoutMs   = 300;   // timeout jednoho pokusu o čtení výkonu
+uint16_t      TuneKeepaliveMs     = 2500;  // TUNE ze sítě (/s-lptune): bez keepalive déle → nosná dolů
 // TrxNet priority peer prefixes — protected from eviction when the peer table
 // fills. Prefix-matched from the start of the device name (705.01/ANT.01/ROT.1).
 // Caller-owned storage: must outlive net (globals). Default mirrors oi3.cfg.
@@ -291,6 +292,7 @@ void readSDSettings() {
       else if (settingName == "TuneMaxMs")           TuneMaxMs = (uint16_t)settingValue.toInt();
       else if (settingName == "TuneSettleMs")        TuneSettleMs = (uint16_t)settingValue.toInt();
       else if (settingName == "TuneReadTimeoutMs")   TuneReadTimeoutMs = (uint16_t)settingValue.toInt();
+      else if (settingName == "TuneKeepaliveMs")     TuneKeepaliveMs = (uint16_t)settingValue.toInt();
       else if (settingName == "PriorityPrefixes") {
         // Replace (not extend) the compiled default. Split on spaces, skip
         // empty tokens, truncate to PRIO_MAX_LEN-1 chars, cap at PRIO_MAX_COUNT.
@@ -811,7 +813,8 @@ void civ_loop() {
 // HW: shares Ethernet (W5100/W5500) with the ETHERNET section. UDP port 5683.
 // Publishes /hz, /mode on change. Subscribes /s-hz, /s-mode (commands from
 // peers — translated to CI-V SET on the radio; the radio's echo path through
-// civ_state_machine() updates CivFreq/CivMode and re-publishes).
+// civ_state_machine() updates CivFreq/CivMode and re-publishes), /s-cw (keyer)
+// and /s-lptune (remote low-power TUNE, see LOW-POWER TUNE; state on /lptune).
 // Gating: NET_ID == 0x00 disables TrxNet entirely (protocol sentinel).
 // Init is deferred to trxnet_loop() so plug-in after boot works without reset.
 // Greeting: on new peer, sends a CON snapshot of /hz + /mode (drained one
@@ -820,6 +823,23 @@ void civ_loop() {
 // Read by the LCD "Peers" menu item even when TrxNet is compiled out
 // (PCB_REV_3_141); stays false on boards without the network stack.
 bool        trxNetStarted = false;
+
+// Low-power TUNE driven over TrxNet (/s-lptune) — drop-box filled by the
+// callback below, consumed by the LOW-POWER TUNE section. Declared outside
+// FEATURE_NET so the tune code compiles unchanged on the 3_141 board.
+//   /s-lptune 1 = start, 2 = keepalive (never starts a tune), 0 = stop,
+//   3 = query (answered with /lptune, which is how a peer learns we take this).
+// A keepalive that cannot start anything is the point: one still in flight
+// when the tune aborts must not key the carrier straight back up.
+volatile bool          trxLpTuneStart = false;
+volatile bool          trxLpTuneQuery = false;
+volatile bool          trxLpTuneStop  = false;
+volatile unsigned long trxLpTuneKaMs  = 0;
+// True for the whole of tune_run(). trxnet_loop() holds /s-hz and /s-mode
+// back while it is set, so a remote retune cannot move the rig under the
+// carrier; they apply after the restore, the latest command winning.
+bool                   tuneActive     = false;
+void lptune_publish(uint8_t st);   // /lptune: 0 idle, 1 carrier, 2 refused, 3 aborted
 
 #ifdef FEATURE_NET
 #include <TrxNet.h>
@@ -866,6 +886,19 @@ static void onSetMode(const char* /*from*/, const uint8_t* data, size_t len) {
   trxSModePending = true;
 }
 
+static void onSetLpTune(const char* /*from*/, const uint8_t* data, size_t len) {
+  if (len < 1) return;
+  if (data[0] == 0) { trxLpTuneStop = true; return; }
+  if (data[0] == 3) { trxLpTuneQuery = true; return; }
+  trxLpTuneKaMs = millis();              // start and keepalive both feed the dead-man
+  if (data[0] == 1) trxLpTuneStart = true;
+}
+
+void lptune_publish(uint8_t st) {
+  if (!trxNetStarted) return;
+  net.publish("/lptune", &st, 1);
+}
+
 void onPeerJoined(const TrxPeer* peer) {
   if (!peer) return;
   if (trxPendingGreetCount >= TRXNET_MAX_PEERS) return;
@@ -879,6 +912,10 @@ static void republishState(const char* peerName) {
   uint8_t  m = CivMode;
   net.publishTo(peerName, "/hz",   (uint8_t*)&f, sizeof(f), TRX_CON);
   net.publishTo(peerName, "/mode", &m,            sizeof(m), TRX_CON);
+  // Also announces that this keyer takes /s-lptune: a peer that never hears
+  // /lptune must not offer a remote tune it cannot get.
+  uint8_t t = tuneActive ? 1 : 0;
+  net.publishTo(peerName, "/lptune", &t,          sizeof(t), TRX_CON);
 }
 
 void trxnet_setup() {
@@ -902,6 +939,7 @@ void trxnet_loop() {
       net.subscribe("/s-hz",   onSetHz);
       net.subscribe("/s-mode", onSetMode);
       net.subscribe("/s-cw",   onSetCw);
+      net.subscribe("/s-lptune", onSetLpTune);
 #if TRXNET_VERSION >= 0x0104
       for (uint8_t i = 0; i < prioCount; i++) prioPtr[i] = prioPrefix[i];
       net.setPriorityPrefixes(prioCount ? prioPtr : nullptr, prioCount);
@@ -913,11 +951,11 @@ void trxnet_loop() {
     net.loop();
   }
 
-  if (trxSHzPending) {
+  if (trxSHzPending && !tuneActive) {
     trxSHzPending = false;
     civ_send_setfreq(trxPendingHz);
   }
-  if (trxSModePending) {
+  if (trxSModePending && !tuneActive) {
     trxSModePending = false;
     civ_send_setmode(trxPendingMode);
   }
@@ -935,6 +973,7 @@ void trxnet_setup()     {}
 void trxnet_loop()      {}
 void civ_publish_freq() {}
 void civ_publish_mode() {}
+void lptune_publish(uint8_t) {}
 #endif // FEATURE_NET
 // =================== END TRXNET ===================
 
@@ -1926,7 +1965,20 @@ void keyer_loop() {
 //   8) restore power then mode (best-effort — runs on every exit incl. abort).
 // Abort (interlock, PTT-up timeout) jumps straight to step 7/8 so the rig is
 // never left silently at low power / in CW.
+//
+// The same action runs from TrxNet (/s-lptune, TUNE_SRC_NET): a peer — the
+// WIFILT PA palette's TUNE+ — keeps the carrier up while an amplifier's own
+// tuner works, and drops it when the amplifier's TUNE flag falls. Only step 6
+// differs: instead of the MODE button the carrier is held until /s-lptune 0,
+// and only while keepalives keep arriving (TuneKeepaliveMs dead-man), so a
+// peer that crashed or lost the network cannot leave the rig keyed until
+// TuneMaxMs. State goes out on /lptune: 1 carrier up, 3 aborted, 0 restored
+// (idle), 2 refused because something else is transmitting.
 static const uint8_t  TUNE_CW_MODE     = 0x03;   // CI-V mode byte for CW carrier
+// Tune source. Plain uint8_t, not an enum: the .ino prototype generator puts
+// function prototypes above any type declared here.
+static const uint8_t  TUNE_SRC_BUTTON  = 0;
+static const uint8_t  TUNE_SRC_NET     = 1;
 
 // TX-idle guard: a tune may start only when nothing else is transmitting.
 static bool tune_tx_idle() {
@@ -1975,9 +2027,9 @@ static void tune_wait_ptt_down() {
   }
 }
 
-static void tune_lcd_show() {
+static void tune_lcd_show(uint8_t src) {
   char buf[17];
-  snprintf(buf, sizeof(buf), "TUNE %u%%", TunePower);
+  snprintf(buf, sizeof(buf), src == TUNE_SRC_NET ? "TUNE %u%% NET" : "TUNE %u%%", TunePower);
   keyerRow1Locked = true;
   lcd.setCursor(0, 1);
   lcd.print(F("                "));
@@ -1986,7 +2038,8 @@ static void tune_lcd_show() {
 }
 
 // Full blocking tune action. Precondition: tune_tx_idle() && CivValid.
-static void tune_run() {
+static void tune_run(uint8_t src) {
+  tuneActive = true;                      // holds /s-hz, /s-mode back until the restore
   // --- 1) read + save current power / mode ---
   uint8_t savedRaw;
   bool haveSaved = civ_read_power_blocking(&savedRaw, TuneReadTimeoutMs, 2);
@@ -2007,30 +2060,46 @@ static void tune_run() {
   // --- 4) settle, then LCD feedback ---
   unsigned long ts = millis();
   while ((millis() - ts) < (unsigned long)TuneSettleMs) { ethernet_loop(); trxnet_loop(); ptt_loop(); }
-  tune_lcd_show();
+  tune_lcd_show(src);
 
   // --- 5) PTT up, then solid carrier ---
   bool keyed = false;
+  bool aborted = false;
   if (tune_wait_ptt_up()) {
     keyed = true;
     digitalWrite(CW1, HIGH);              // solid carrier (rig provides its own sidetone)
     digitalWrite(CW2, HIGH);
+    lptune_publish(1);
 
     // --- 6) hold: min TuneHoldMs, then until MODE released; hard cap TuneMaxMs ---
+    //     NET: until /s-lptune 0, while keepalives keep arriving; same cap.
     unsigned long tStart = millis();
     for (;;) {
       ethernet_loop(); trxnet_loop(); ptt_loop();
       civLastParseMs = millis();
-      if (ptt_interlock_active) break;                     // abort on interlock
+      if (ptt_interlock_active) { aborted = true; break; }   // abort on interlock
       unsigned long elapsed = millis() - tStart;
-      bool held = (digitalRead(MENU) == LOW);
-      if (!held && elapsed >= (unsigned long)TuneHoldMs) break;   // released after min hold
-      if (elapsed >= (unsigned long)TuneMaxMs) {                  // stuck-button safety cap
+      if (src == TUNE_SRC_NET) {
+        if (trxLpTuneStop) break;                                  // peer says done
+        if ((millis() - trxLpTuneKaMs) > (unsigned long)TuneKeepaliveMs) {
+          tone(TONE, 200, 200);                                    // peer went silent
+          aborted = true;
+          break;
+        }
+      } else {
+        bool held = (digitalRead(MENU) == LOW);
+        if (!held && elapsed >= (unsigned long)TuneHoldMs) break; // released after min hold
+      }
+      if (elapsed >= (unsigned long)TuneMaxMs) {                  // stuck-button / peer safety cap
         tone(TONE, 200, 200);
+        aborted = true;
         break;
       }
     }
+  } else {
+    aborted = true;                        // interlock or sequencer timeout
   }
+  if (aborted) lptune_publish(3);
 
   // --- 7) carrier off, PTT down ---
   if (keyed) {
@@ -2052,6 +2121,30 @@ static void tune_run() {
   lcd.print(F("                "));
   keyerLcdTxCol   = 0;
   keyerRow1Locked = false;
+
+  // /s-cw text that arrived under the carrier is dropped, not sent: a macro
+  // keyed seconds after the tune finished would go out unasked.
+  trxCwPending   = false;
+  trxLpTuneStart = false;                 // a start that raced the tune is not a new one
+  trxLpTuneStop  = false;
+  tuneActive     = false;
+  lptune_publish(0);
+}
+
+// Remote start (/s-lptune 1), picked up in loop() rather than in the callback:
+// tune_run() blocks and pumps trxnet_loop() itself.
+void lptune_net_loop() {
+  // A peer that restarted is not new to us, so it got no greeting: it asks.
+  if (trxLpTuneQuery) { trxLpTuneQuery = false; lptune_publish(tuneActive ? 1 : 0); }
+  if (!trxLpTuneStart) return;
+  trxLpTuneStart = false;
+  trxLpTuneStop  = false;
+  if (tune_tx_idle()) {
+    tune_run(TUNE_SRC_NET);
+  } else {
+    tone(TONE, 200, 120);                 // refused: same beep as the MODE button
+    lptune_publish(2);
+  }
 }
 // =================== END LOW-POWER TUNE ===================
 
@@ -2709,7 +2802,7 @@ void lcd_loop() {
     if (!CivValid) {
       civ_mode_cycle_next();          // rig silent → local mode rotation
     } else if (tune_tx_idle()) {
-      tune_run();                     // rig active → exclusive blocking tune
+      tune_run(TUNE_SRC_BUTTON);      // rig active → exclusive blocking tune
     } else {
       tone(TONE, 200, 120);           // refused: something else is transmitting
     }
@@ -2759,6 +2852,7 @@ void setup() {
 void loop() {
   ethernet_loop();
   trxnet_loop();
+  lptune_net_loop();
   civ_loop();
   ptt_loop();
   keyer_loop();
