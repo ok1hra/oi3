@@ -286,6 +286,7 @@ void readSDSettings() {
       else if (settingName == "KeyerSidetoneHz") KeyerSidetoneHz = (uint16_t)settingValue.toInt();
       else if (settingName == "KeyerRttyBaud")   KeyerRttyBaud = (byte)settingValue.toInt();
       else if (settingName == "KeyerFskReverse") KeyerFskReverse = (bool)settingValue.toInt();
+      else if (rkey_cfg(settingName, settingValue)) {}   // Rkey* keys (rkey.ino)
       else if (settingName == "TunePower")           TunePower = (byte)settingValue.toInt();
       else if (settingName == "TuneRestoreFallback") TuneRestoreFallback = (byte)settingValue.toInt();
       else if (settingName == "TuneHoldMs")          TuneHoldMs = (uint16_t)settingValue.toInt();
@@ -651,7 +652,7 @@ bool civ_read_power_blocking(uint8_t* raw, uint16_t timeoutMs, uint8_t retries) 
     uint8_t sm = 0, d1 = 0, d2 = 0;
     unsigned long t0 = millis();
     while ((millis() - t0) < timeoutMs) {
-      ethernet_loop(); trxnet_loop(); ptt_loop();
+      ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop();
       while (Serial2.available() > 0) {
         uint8_t b = (uint8_t)Serial2.read();
         switch (sm) {
@@ -1043,6 +1044,7 @@ static void ptt_abort_all() {
   digitalWrite(PTT3, LOW);
   SequencerLevel = 0;
   PttActive = false;
+  rkey_abort();          // remote CW stream: release CW1/CW2, flush, mute
 }
 
 // Non-blocking port of k3ng OpenInterfaceSequencer(). State transitions are
@@ -1141,7 +1143,8 @@ static void ptt_inputs_poll() {
   // PttActive stays false and the sequencer never leaves level 0 — no PTT123 / PA
   // / SEQ output. CW/FSK keying is unaffected (the keyer bypasses the gate below).
   ptt_request(PttOutputEnable
-              && (footSwTx || ptt232Tx || ilInTx || keyerPttRequest || tunePttRequest));
+              && (footSwTx || ptt232Tx || ilInTx || keyerPttRequest || tunePttRequest
+                  || rkey_ptt_wanted()));
 }
 
 void ptt_setup() {
@@ -1537,6 +1540,7 @@ static void keyer_wait_us_pump(unsigned long us) {
   while ((elapsed = micros() - start) < us) {
     ethernet_loop();
     trxnet_loop();
+    rkey_loop();
     civ_loop();
     ptt_loop();
     keyer_check_paddles_cmos(elapsed, us);
@@ -1571,6 +1575,7 @@ static bool keyer_begin_tx_wait_sequencer() {
   while (SequencerLevel != PttOut) {
     ethernet_loop();
     trxnet_loop();
+    rkey_loop();
     civ_loop();
     ptt_loop();
     if (trxCwAbort)             { keyerPttRequest = false; return false; }
@@ -1747,7 +1752,8 @@ static void keyer_paddle_step() {
   else        keyerDahBuf = 0;
 
   // CW/CWR → drive CW pin via sequencer; other modes → sidetone only
-  bool keyHw = (CivValid && (CivMode == 0x03 || CivMode == 0x07));
+  // Remote CW stream owns CW1/CW2 while active: local paddle = sidetone only.
+  bool keyHw = (CivValid && (CivMode == 0x03 || CivMode == 0x07)) && !rkey_busy();
   if (keyHw) {
     if (!keyer_begin_tx_wait_sequencer()) return;
   }
@@ -1769,6 +1775,8 @@ static void keyer_paddle_step() {
 // ----- TrxNet send buffer drain (one char per call, mode-dispatched) -----
 static void keyer_send_buffer_drain() {
   if (keyerSendHead == keyerSendTail) return;
+  // Remote CW stream on the air → hold /s-cw text until it finishes
+  if (rkey_busy()) return;
   // Paddle in flight or pending → defer (paddle has priority)
   if (keyerDitBuf || keyerDahBuf) return;
   if (keyer_paddle_dit_pressed() || keyer_paddle_dah_pressed()) return;
@@ -1792,6 +1800,8 @@ static void keyer_ptt_tail_service() {
   // PttActive, but an RTTY session still drove the FSK line, so it must still be
   // released after the hang time — run the tail logic in that case too.
   if (!PttActive && PttOutputEnable) return;
+  // PTT held by the remote CW stream: don't toggle PttActive under it.
+  if (rkey_busy()) return;
   if (keyerSendHead != keyerSendTail) return;
   if (keyerDitBuf || keyerDahBuf) return;
   if (keyer_paddle_dit_pressed() || keyer_paddle_dah_pressed()) return;
@@ -2002,7 +2012,7 @@ static bool tune_wait_ptt_up() {
   ptt_request(true);                  // set PttActive/PttOut now (mirrors keyer)
   unsigned long t0 = millis();
   while (SequencerLevel != PttOut) {
-    ethernet_loop(); trxnet_loop(); ptt_loop();
+    ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop();
     civLastParseMs = millis();
     if (ptt_interlock_active)    return false;
     if ((millis() - t0) > 2000)  return false;   // safety
@@ -2020,7 +2030,7 @@ static void tune_wait_ptt_down() {
   tunePttRequest = false;
   unsigned long t0 = millis();
   while (SequencerLevel != 0) {
-    ethernet_loop(); trxnet_loop(); ptt_loop();
+    ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop();
     civLastParseMs = millis();
     if (ptt_interlock_active)   break;            // interlock already forced down
     if ((millis() - t0) > 3000) break;            // safety
@@ -2059,7 +2069,7 @@ static void tune_run(uint8_t src) {
 
   // --- 4) settle, then LCD feedback ---
   unsigned long ts = millis();
-  while ((millis() - ts) < (unsigned long)TuneSettleMs) { ethernet_loop(); trxnet_loop(); ptt_loop(); }
+  while ((millis() - ts) < (unsigned long)TuneSettleMs) { ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop(); }
   tune_lcd_show(src);
 
   // --- 5) PTT up, then solid carrier ---
@@ -2075,7 +2085,7 @@ static void tune_run(uint8_t src) {
     //     NET: until /s-lptune 0, while keepalives keep arriving; same cap.
     unsigned long tStart = millis();
     for (;;) {
-      ethernet_loop(); trxnet_loop(); ptt_loop();
+      ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop();
       civLastParseMs = millis();
       if (ptt_interlock_active) { aborted = true; break; }   // abort on interlock
       unsigned long elapsed = millis() - tStart;
@@ -2846,12 +2856,14 @@ void setup() {
   trxnet_setup();
   ptt_setup();
   keyer_setup();
+  rkey_setup();
   lcd_runtime_init();
 }
 
 void loop() {
   ethernet_loop();
   trxnet_loop();
+  rkey_loop();
   lptune_net_loop();
   civ_loop();
   ptt_loop();
