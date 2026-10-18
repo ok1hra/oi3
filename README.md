@@ -40,6 +40,7 @@ means.
   - [PTT timing](#ptt-timing)
   - [CW decoder (paddle → LCD row 1)](#cw-decoder-paddle--lcd-row-1)
   - [TrxNet remote CW](#trxnet-remote-cw)
+  - [Remote CW key server (Paddle2IP)](#remote-cw-key-server-paddle2ip)
   - [RTTY / FSK output](#rtty--fsk-output)
   - [Persistence](#persistence)
 - [TrxNet (peer-to-peer LAN)](#trxnet-peer-to-peer-lan)
@@ -490,6 +491,18 @@ to the OI3 and it will be:
 
 A single-byte payload of `0x03` (ETX) or `0xFF` aborts the in-flight
 send and flushes the buffer — useful for remote "stop sending" buttons.
+
+### Remote CW key server (Paddle2IP)
+
+With `RkeyEnable=1` the OI3 also works as the server for a
+[Paddle2IP](https://github.com/ok1hra/paddle2ip) remote paddle (M5Stack Dial
+with a paddle, local keyer and sidetone). Paddle2IP sends the key edges with
+its own timestamps over UDP (port `RkeyPort`, signed with `RkeyKey`), and the
+OI3 replays them on CW1/CW2 through the sequencer with a fixed playout delay,
+so the element lengths on air are exact regardless of network jitter. Keying
+happens only in CW/CWR, without interlock and without a tune in progress;
+while a remote stream is active the local paddle is sidetone-only.
+Configuration, behaviour and test tools: [doc/remote-cw-key.md](doc/remote-cw-key.md).
 
 ### RTTY / FSK output
 

@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Remote CW key — PC test tool for the OI3 receiver (rkey.ino) and the M5Dial.
+"""Remote CW key — PC test tool for the OI3 server (rkey.ino) and the Paddle2IP client.
 
-  send      act as the M5Dial: key TEXT into the OI3 as KEY packets
+  send      act as Paddle2IP: key TEXT into the OI3 as KEY packets
   attack    check that forged, replayed and stale-nonce packets are refused
-  rig       act as the OI3: receive KEY packets from a Dial, print the edges
+  rig       act as the OI3: receive KEY packets from Paddle2IP, print the edges
   selftest  check the SipHash-2-4 implementation against the reference vector
 
-The protocol is rkey_proto.h (little-endian). The key is the 32-hex-char
+The protocol is rkey_proto.h (little-endian). This file is kept identical in
+the OI3 repo (test/) and the Paddle2IP repo (tools/). The key is the 32-hex-char
 RkeyKey: --key HEX, environment RKEY_KEY, or --cfg path/to/oi3.cfg.
 
 Examples
   ./rkey_test.py send 192.168.1.50 --cfg ../oi3.cfg --wpm 25 --text "CQ TEST"
   ./rkey_test.py send 192.168.1.50 --key 00112233445566778899aabbccddeeff --loss 0.2 --jitter 30
   ./rkey_test.py attack 192.168.1.50 --cfg ../oi3.cfg
-  ./rkey_test.py rig --key 00112233445566778899aabbccddeeff      (Dial host = this PC)
+  ./rkey_test.py rig --key 00112233445566778899aabbccddeeff      (Paddle2IP server = this PC)
 """
 import argparse
 import os
@@ -132,7 +133,7 @@ DECODE = {v: k for k, v in MORSE.items()}
 
 
 def text_edges(text, wpm, t0):
-    """Ideal edges [(t_us, down)] like the Dial keyer generates them."""
+    """Ideal edges [(t_us, down)] like the Paddle2IP keyer generates them."""
     dit = 1200000 // wpm
     t, out = t0, []
     for ch in text.upper():
@@ -145,7 +146,7 @@ def text_edges(text, wpm, t0):
         t += 2 * dit                          # 1 + 2 = 3 dits letter space
     return out
 
-# ---------------------------------------------------------------- CTRL (Dial) side
+# ---------------------------------------------------------------- CTRL (Paddle2IP) side
 
 
 class Sender:
@@ -477,7 +478,7 @@ def main():
     p.add_argument("--wpm", type=int, default=25)
     p.add_argument("--local-port", type=int, default=0)
 
-    p = sub.add_parser("rig", help="fake OI3 for testing the Dial")
+    p = sub.add_parser("rig", help="fake OI3 for testing Paddle2IP")
     common(p, host=False)
 
     sub.add_parser("selftest", help="SipHash reference vector")

@@ -1,5 +1,6 @@
-// rkey_proto.h — Remote CW key protocol (M5Dial CTRL  <->  OI3 RIG)
-// Shared verbatim by both firmwares (AVR + ESP32, both little-endian).
+// rkey_proto.h — Remote CW key protocol (CTRL = Paddle2IP  <->  RIG = OI3)
+// Identical copy in both repositories: github.com/ok1hra/paddle2ip (ESP32)
+// and github.com/ok1hra/oi3 (AVR). Both targets are little-endian.
 //
 // Principle: the sender's keyer GENERATES the elements, so it knows the ideal
 // edge times. It sends those times (its own µs clock), never sampled audio.

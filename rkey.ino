@@ -1,9 +1,10 @@
 // ===================== REMOTE CW KEY (RKEY) =====================
-// Receiver side of the remote CW key: an operator's M5Dial ("CTRL") runs the
-// iambic keyer + local sidetone and streams the generated key EDGES over UDP;
-// this module replays them on CW1/CW2 with a fixed playout delay.
+// Server side of the remote CW key: the operator's Paddle2IP client ("CTRL",
+// M5Stack Dial, https://github.com/ok1hra/paddle2ip) runs the iambic keyer +
+// local sidetone and streams the generated key EDGES over UDP; this module
+// replays them on CW1/CW2 with a fixed playout delay.
 //
-// Protocol: rkey_proto.h (shared with the CTRL firmware).
+// Protocol: rkey_proto.h (identical copy in the Paddle2IP repository).
 //
 // Timing model
 //   playAt = t_sender + rkOffset,  rkOffset = min(arrive - t_sender) + D
