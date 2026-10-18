@@ -14,7 +14,7 @@
 //     in loop() (LCD, CI-V, SPI to W5500, blocking keyer waits) adds jitter
 //   - a late KEY-DOWN shifts the rest of the over (gap absorbs it, mark length
 //     preserved); a late KEY-UP is applied immediately (counted)
-//   - clock drift CTRL vs. RIG (crystal vs. resonator, up to 0.5 %) is slewed
+//   - clock drift CTRL vs. RIG (both crystals, typ. < 100 ppm; up to 0.5 % handled) is slewed
 //     out at most 1.5 ms per mark start, i.e. always inside a gap
 //
 // Safety
@@ -336,8 +336,9 @@ static void rk_schedule_edge(uint32_t e) {
   if (!rk_q_push(at, down)) { rk_abort_internal(F("queue full")); rkMuted = true; }
 }
 
-static void rk_on_packet(const uint8_t* buf, uint16_t n, IPAddress ip, uint16_t port) {
-  uint32_t arrive = micros();
+// (no IPAddress in the signature: arduino-cli emits prototypes above the
+// Ethernet include, so the peer is read from the socket here)
+static void rk_on_packet(const uint8_t* buf, uint16_t n, uint32_t arrive) {
   if (n < sizeof(RkeyKeyHdr) + RKEY_TAG_LEN) return;
   RkeyKeyHdr h;
   memcpy(&h, buf, sizeof(h));
@@ -347,7 +348,7 @@ static void rk_on_packet(const uint8_t* buf, uint16_t n, IPAddress ip, uint16_t 
   if (!rkey_verify(RkeyKey, buf, n)) { rkBadAuth++; return; }
 
   // Authenticated: this is our CTRL. Remember where to send status.
-  rkPeerIp = ip; rkPeerPort = port; rkPeerValid = true;
+  rkPeerIp = rkUdp.remoteIP(); rkPeerPort = rkUdp.remotePort(); rkPeerValid = true;
   bool nonceOk = rk_nonce_ok(h.nonce);
   rkNonceBad = !nonceOk;
 
@@ -393,7 +394,8 @@ static void rk_on_packet(const uint8_t* buf, uint16_t n, IPAddress ip, uint16_t 
       uint32_t last; memcpy(&last, ev + 4u * (h.nev - 1), 4);
       uint32_t wordUs = 5UL * 1200000UL / rkWpm;
       bool idxKnown = ((int16_t)((uint16_t)(h.evIdx0 + h.nev) - rkNextEvIdx) <= 0);  // nothing unseen
-      release = idxKnown && !RKEY_EV_DOWN(last) && (h.tSend - RKEY_EV_TIME(last)) > wordUs;
+      // signed: an edge stamped after tSend must not look like a long gap
+      release = idxKnown && !RKEY_EV_DOWN(last) && (int32_t)(h.tSend - RKEY_EV_TIME(last)) > (int32_t)wordUs;
     }
     if (release) { rkMuted = false; rkLastState = false; }
   }
@@ -511,8 +513,9 @@ void rkey_loop() {
     int n = rkUdp.parsePacket();
     if (n <= 0) break;
     if (n > (int)sizeof(buf)) { while (rkUdp.available()) rkUdp.read(); continue; }
+    uint32_t arrive = micros();
     rkUdp.read(buf, n);
-    rk_on_packet(buf, (uint16_t)n, rkUdp.remoteIP(), rkUdp.remotePort());
+    rk_on_packet(buf, (uint16_t)n, arrive);
   }
   rk_service();
 }

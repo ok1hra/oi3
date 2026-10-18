@@ -24,6 +24,8 @@ paddle ─► M5Dial: iambic keyer ─► buzzer sidetone (0 ms)
 | `rkey.ino` | Receiver module (second sketch tab, compiled together with `oi3.ino`). |
 | `oi3.ino` | Hooks: cfg parser, PTT OR, `ptt_abort_all()`, keyer arbitration, loop/setup, pump loops. |
 | `test/rkey_sim/` | Host simulation of the receiver (loss, jitter, clock drift, blackout). |
+| `test/rkey_test.py` | PC tool: key text into the OI3, security checks, fake OI3 for the Dial. |
+| `rkey_dial/` | M5Dial firmware (sender). Has its own verbatim copy of `rkey_proto.h`. |
 
 ## Configuration (`oi3.cfg`)
 
@@ -48,7 +50,7 @@ progress. While a remote stream is active the local paddle is sidetone-only and
   Edges are emitted by a Timer1 compare ISR (4 µs resolution).
 * **Late key-down** shifts the rest of the over (the gap absorbs it, mark length
   is kept) and increases an adaptive extra delay that decays by ¼ at each new over.
-* **Clock drift** (Dial crystal vs. OI3 crystal/resonator, up to 0.5 %) is
+* **Clock drift** (Dial crystal vs. OI3 crystal, typically < 100 ppm; handled up to 0.5 %) is
   corrected by at most 1.5 ms per mark start, i.e. always inside a gap.
 * **Sequencer**: the first edge waits for `SequencerLevel == PttOut` + `PTTlead`.
   D is raised to cover `SEQUENCERlead + PAlead + PTTlead` when the sequencer is down.
@@ -84,7 +86,8 @@ Little-endian, see `rkey_proto.h`.
   the build touches Timer1), one W5x00 UDP socket, EEPROM 4092–4095 (boot
   counter for nonce entropy).
 * Measured with avr-gcc 7.3, ATmega2560: flash 74.7 kB (+11.6 kB), static RAM
-  6222 B (+556 B, 76 %). SipHash of one KEY packet ≈ 18.5 k cycles ≈ 1.2 ms
+  6222 B (+556 B, 76 %). With `./build.sh` (arduino-cli, arduino:avr 1.8.6):
+  flash 66.9 kB, static RAM 5855 B (71 %). SipHash of one KEY packet ≈ 18.5 k cycles ≈ 1.2 ms
   (simavr), about 7 % CPU at 50 packets/s.
 
 ## Simulation
@@ -107,3 +110,78 @@ Results (text "CQ CQ TEST 5NN K CQ TEST R", 102 edges):
 | 2 s blackout mid-mark | mark cut after 267 ms | — | resumes at next word |
 
 (25 µs is the simulation step, not the firmware resolution.)
+
+## M5Dial firmware (`rkey_dial/`)
+
+Arduino sketch for the M5Stack Dial v1.1. Board *M5Stack → M5Dial*
+(`m5stack:esp32:m5stack_dial`, M5Stack core 2.1.x), library *M5Dial*.
+`rkey_dial/build.sh` builds it and fails if `rkey_dial/rkey_proto.h` is not
+identical to the one in the repo root. After changing the protocol, copy it:
+`cp rkey_proto.h rkey_dial/`.
+
+| Task | Core | What |
+|---|---|---|
+| keyer | 1 | 1 ms tick: paddle, iambic A/B (the OI3/K3NG logic incl. CMOS Super Keyer timing), sidetone, edge ring |
+| rkey-net | 0 | KEY packets (on every edge, heartbeat 20/100 ms), STATUS: nonce, RTT, loss |
+| rkey-ui | 0 | display, encoder (PCNT), button, WiFi, web page, NVS |
+
+Edge timestamps are the keyer's ideal times: consecutive elements are chained
+exactly (1 or 3 dits + 1 dit gap), only the first element after idle starts at
+the tick that saw the paddle. The buzzer (G3) runs LEDC continuously at the
+sidetone frequency; keying only switches the duty between 0 and the volume
+(1–50 %). While the key is down, the newest key-down edge is always included
+in the packet, so the OI3 never sees `nev = 0` (idle) during a long mark.
+NVS writes stall both cores, so changed settings are saved only after the
+keyer has been idle for 2 s.
+
+**Wiring.** Port B: G2 = dit, G1 = dah, common = GND; internal pull-ups, add
+100 Ω in series and 10 nF to GND. Do not connect the red 5 V wire. Port A
+(optional, enable on the web page): G13 straight key to GND, G15 PWM tone for
+headphones (through an RC filter and a series resistor).
+
+**Controls.** Encoder: one detent = one step (`ENC_COUNTS_PER_DETENT` in
+`shared.h`, 4 = x4 quadrature; check on hardware). Short press cycles the
+encoder function WPM → tone → volume → D → iambic A/B, and the display returns
+to WPM 6 s after the last change. D = 0 means the OI3 uses `RkeyDelayMs`.
+Long press shows the info page (IP, RSSI, OI3 address, session, counters).
+
+**Display.** Rig frequency and mode on top, the big value of the selected
+function in the centre, a warning line (NO KEY, NO WIFI, NO LINK, SYNC =
+stale nonce, INTERLOCK, TUNE, TRX NOT CW, MUTED), and at the bottom
+`RTT last/min ms`, the D in use, uplink/downlink loss in % and the OI3
+`lost/late` edge counters. The ring is red while the OI3 has the key down,
+green with a live link, grey without one.
+
+**Setup.** Hold the button while powering on, or start without a WiFi SSID:
+the Dial opens the AP `RKEY-Dial-XXXX` (password = web password, default
+`rkeydial`) at http://192.168.4.1. If the STA cannot connect within 20 s, the
+AP is opened as well and closed again 30 s after the STA is back. The web
+page (user `admin`, the web password) sets WiFi, OI3 IP or hostname, port, key, D,
+keyer values and the Port A options. Passwords and the key are write-only.
+*Generate new key* stores a random key and shows it once as
+`[RkeyKey=...]` for `oi3.cfg`. `/status` returns the link state as JSON.
+
+Not tested on hardware yet. To check: encoder direction and counts per
+detent, buzzer volume at low duty, sidetone timing under WiFi load.
+
+## PC test tool (`test/rkey_test.py`)
+
+Python 3, no dependencies. The key comes from `--key HEX`, `RKEY_KEY` or `--cfg oi3.cfg`.
+
+```
+./rkey_test.py send 192.168.1.50 --cfg ../oi3.cfg --wpm 25 --text "CQ TEST"
+./rkey_test.py send 192.168.1.50 --cfg ../oi3.cfg --loss 0.2 --jitter 40 --repeat 3
+./rkey_test.py attack 192.168.1.50 --cfg ../oi3.cfg
+./rkey_test.py rig --key <hex>          # fake OI3 on UDP 5690, point the Dial at this PC
+./rkey_test.py selftest                 # SipHash-2-4 reference vector
+```
+
+* `send` acts as the Dial: syncs the nonce, keys the text with ideal edge
+  times, prints the STATUS changes, the RTT and the OI3 counters. `--loss` and
+  `--jitter` simulate a bad network on the sending side.
+* `attack` sends packets with a bad tag, a modified body, a wrong key, replayed
+  packets, and new sessions with a stale or no nonce. It then checks that the
+  OI3 `rxPkts` counter rose only by the genuine heartbeat.
+* `rig` verifies the Dial's packets, issues nonces, answers STATUS and prints
+  every mark/space length from the sender clock with the packet jitter and
+  the decoded text.

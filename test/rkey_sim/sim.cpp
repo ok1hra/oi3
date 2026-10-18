@@ -42,7 +42,7 @@ int main(int argc,char**argv){
       if(!black && (rand()/(double)RAND_MAX)>=loss) net.push_back({now+lat+jit*(rand()/(double)RAND_MAX), b});
     }
     // deliver
-    for(size_t i=0;i<net.size();){ if(net[i].arrive<=now){ IPAddress ip; rk_on_packet(net[i].b.data(),net[i].b.size(),ip,1); net.erase(net.begin()+i);} else i++; }
+    for(size_t i=0;i<net.size();){ if(net[i].arrive<=now){ rk_on_packet(net[i].b.data(),net[i].b.size(),(uint32_t)g_now_us); net.erase(net.begin()+i);} else i++; }
     if(g_now_us%1000==0){ rk_service();
       // sequencer model: up after 20 ms, down after 200 ms tail
       static double upReq=-1, dnReq=-1; bool w=rkey_ptt_wanted();

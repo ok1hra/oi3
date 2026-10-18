@@ -9,3 +9,4 @@
 
 # Build output - binaries are not tracked; regenerate with ./build.sh
 /out/
+/rkey_dial/out/
