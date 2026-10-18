@@ -216,9 +216,10 @@ AFSK from the PC, etc.) without ever lying about the rig's real state.
 
 ## Menu items
 
-24 items, indexed 0..23. Items 0..6 and 23 are read-only status; 7 is
-browse-only (peer list); 8..22 are editable settings. The mode cell on
-the right of row 0 is the same on every item.
+26 items, indexed 0..25. Items 0..6, 23 and 25 are read-only status; 7 is
+browse-only (peer list); 8..22 and 24 are editable settings. The mode cell
+on the right of row 0 is the same on every item. Item 25 also takes over
+row 1 while it is selected.
 
 | #  | Name          | Example display      | Editable | Range / values                  | Purpose |
 |----|---------------|----------------------|----------|---------------------------------|---------|
@@ -246,6 +247,8 @@ the right of row 0 is the same on every item.
 | 21 | FSK polarity  | `FSK N` / `FSK R`    | yes      | Normal ↔ Reverse                | Invert MARK/SPACE drive levels on the FSK pin. |
 | 22 | Debug         | `Debug off`          | yes (not persisted) | on ↔ off              | Enable verbose serial logging (`[CIV freq=…]`, `[PTT…]`, etc). Off by default; init banners and errors always print. |
 | 23 | UDP port      | `UDP 5683` / `no net` | no       | — (from cfg)                    | TrxNet UDP port (`UdpPort` in `oi3.cfg`). `no net` on boards without the network stack. |
+| 24 | PTT output    | `PTTout on` / `PTTout off` | yes (not persisted) | on ↔ off             | PTT outputs enabled; always on after reboot. |
+| 25 | Remote key    | `IPkey CONN` / `IPkey DISC` / `IPkey off` | no | —                      | Remote CW key server link: `CONN` = a Paddle2IP session is sending (packet < 1 s ago, valid nonce), `DISC` = no client, `off` = `RkeyEnable=0` or no `RkeyKey`. While selected, **row 1** shows the elements actually played on CW1/CW2, newest on the right: `.` / `-` by mark length at the sender's WPM, space = letter gap, ` / ` = word gap, `*` = mark cut by an abort (link loss, interlock, …). Example: `-.-. --.- / -.-`. The keyer TX echo is paused on row 1 meanwhile. See [doc/remote-cw-key.md](doc/remote-cw-key.md). |
 
 Items 16..21 are persisted to EEPROM on the EDITING→BROWSING transition.
 Items 7, 8..15 and 22 are intentionally **not** persisted — sequencer

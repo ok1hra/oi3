@@ -22,7 +22,9 @@
 //   - nothing is keyed unless: RkeyEnable, key set, CW/CWR mode, no interlock,
 //     no low-power tune running
 //   - key-down with no packet for RkeyLinkTimeoutMs, or longer than
-//     RkeyMaxDownMs -> abort + mute
+//     RkeyMaxDownMs -> abort + mute. Checked in the Timer1 ISR too (every
+//     50 ms while the key is down), so a blocked main loop (e.g. a DHCP renew
+//     in Ethernet.maintain()) can never leave the transmitter keyed
 //   - edge gap larger than the redundancy (lost edges) -> abort + mute
 //   - after an abort the stream stays muted until CTRL reports idle, so a
 //     stale/partial over is never transmitted
@@ -33,8 +35,14 @@
 // HW resources: Timer1 (free on OI3 — tone() uses Timer2, millis() Timer0),
 // one W5500/W5100 UDP socket on RkeyPort.
 //
+// LCD (menu item "IPkey"): rkey_link_state() = off / DISC / CONN, and
+// rkey_trace16() = the elements actually played on CW1/CW2 ('.' / '-' by the
+// mark length at sender WPM, ' ' letter gap, " / " word gap, '*' mark cut by
+// an abort). The ISR only logs edges; the trace is built in rkey_loop().
+//
 // Public API: rkey_setup(), rkey_loop(), rkey_ptt_wanted(), rkey_busy(),
-//             rkey_abort(), rkey_cfg(name, value)
+//             rkey_abort(), rkey_cfg(name, value), rkey_link_state(),
+//             rkey_trace16(out), rkey_keying_recent()
 
 #if defined(FEATURE_NET)
 #include "rkey_proto.h"
@@ -98,6 +106,23 @@ static volatile uint8_t  rkQHead = 0, rkQTail = 0;
 static volatile bool     rkOutDown = false;
 static volatile uint32_t rkDownSinceUs = 0;
 static volatile uint32_t rkLastUpUs = 0;
+// ISR watchdog: while the key is down the ISR runs at least every 50 ms and
+// releases it on link timeout / max key-down without help from loop().
+#define RK_WD_TICKS 12500                      // 50 ms in 4 µs ticks
+static volatile uint32_t rkWdLastPktUs = 0;    // arrival of the last accepted packet
+static uint32_t          rkWdLinkUs = 300000UL, rkWdMaxDownUs = 3000000UL;   // from cfg in rkey_setup()
+static volatile bool     rkWdTripped = false;  // ISR released the key -> loop aborts + mutes
+
+// played edges for the LCD trace (ISR -> rk_trace_service)
+#define RK_PL 8                                // power of two
+struct RkPl { uint32_t at; uint8_t s; };       // s: 1 = down, 0 = up, 2 = up by abort
+static volatile RkPl     rkPl[RK_PL];
+static volatile uint8_t  rkPlHead = 0, rkPlTail = 0;
+static inline void rk_pl_push_locked(uint32_t at, uint8_t s) {
+  rkPl[rkPlHead].at = at; rkPl[rkPlHead].s = s;
+  rkPlHead = (rkPlHead + 1) & (RK_PL - 1);     // overflow drops the oldest
+  if (rkPlHead == rkPlTail) rkPlTail = (rkPlTail + 1) & (RK_PL - 1);
+}
 static volatile uint8_t* rkPort1;  static uint8_t rkMask1;
 static volatile uint8_t* rkPort2;  static uint8_t rkMask2;
 
@@ -106,27 +131,45 @@ static inline void rk_out_locked(bool down) {     // interrupts must be off
   else      { *rkPort1 &= ~rkMask1; *rkPort2 &= ~rkMask2; }
 }
 
-// Program Timer1 compare A for the queue head. Interrupts must be off.
+// Program Timer1 compare A for the queue head (and the watchdog while the key
+// is down). Interrupts must be off.
 static void rk_arm_locked(uint32_t now) {
-  if (rkQHead == rkQTail) { TIMSK1 &= ~_BV(OCIE1A); return; }
-  int32_t d = (int32_t)(rkQ[rkQTail].at - now);
-  uint32_t ticks = (d <= 40) ? 10 : ((uint32_t)d >> 2);   // 4 µs/tick, min 40 µs
-  if (ticks < 10)    ticks = 10;
-  if (ticks > 60000) ticks = 60000;                          // re-check every 240 ms
+  uint32_t ticks;
+  if (rkQHead == rkQTail) {
+    if (!rkOutDown) { TIMSK1 &= ~_BV(OCIE1A); return; }
+    ticks = RK_WD_TICKS;
+  } else {
+    int32_t d = (int32_t)(rkQ[rkQTail].at - now);
+    ticks = (d <= 40) ? 10 : ((uint32_t)d >> 2);           // 4 µs/tick, min 40 µs
+    if (ticks < 10)    ticks = 10;
+    if (ticks > 60000) ticks = 60000;                        // re-check every 240 ms
+    if (rkOutDown && ticks > RK_WD_TICKS) ticks = RK_WD_TICKS;
+  }
   OCR1A  = (uint16_t)(TCNT1 + ticks);
   TIFR1  = _BV(OCF1A);
   TIMSK1 |= _BV(OCIE1A);
 }
 
+// Watchdog trip inside the ISR: key up, drop the queue, tell loop().
+static inline void rk_wd_trip_locked(uint32_t now) {
+  if (rkOutDown) { rk_out_locked(false); rkOutDown = false; rkLastUpUs = now; rk_pl_push_locked(now, 2); }
+  rkQTail = rkQHead;
+  rkWdTripped = true;
+}
+
 ISR(TIMER1_COMPA_vect) {
   uint32_t now = micros();
+  bool linkOk = (now - rkWdLastPktUs) <= rkWdLinkUs;
   while (rkQHead != rkQTail && (int32_t)(now - rkQ[rkQTail].at) >= 0) {
     bool d = rkQ[rkQTail].down;
+    if (d && !linkOk) { rk_wd_trip_locked(now); break; }    // never start a mark on a dead link
     rk_out_locked(d);
     if (d) { rkOutDown = true;  rkDownSinceUs = now; }
     else   { rkOutDown = false; rkLastUpUs = now; }
+    rk_pl_push_locked(now, d ? 1 : 0);
     rkQTail = (rkQTail + 1) & (RK_Q - 1);
   }
+  if (rkOutDown && (!linkOk || (now - rkDownSinceUs) > rkWdMaxDownUs)) rk_wd_trip_locked(now);
   rk_arm_locked(now);
 }
 
@@ -160,6 +203,7 @@ static IPAddress rkPeerIp;
 static uint16_t rkPeerPort = 0;
 static bool     rkPeerValid = false;
 static uint32_t rkEchoTSend = 0, rkLastPktUs = 0;
+static unsigned long rkActiveMs = 0;     // last packet with RKEY_KF_ACTIVE (operator keying)
 static unsigned long rkLastPktMs = 0;
 static uint8_t  rkWpm = 20;
 static uint16_t rkReqDelayMs = 0;
@@ -237,7 +281,7 @@ static void rk_abort_internal(const __FlashStringHelper* why) {
   rkQTail = rkQHead;
   TIMSK1 &= ~_BV(OCIE1A);
   rk_out_locked(false);
-  if (rkOutDown) rkLastUpUs = micros();
+  if (rkOutDown) { rkLastUpUs = micros(); rk_pl_push_locked(rkLastUpUs, 2); }
   rkOutDown = false;
   SREG = s;
   rkPendH = rkPendT = 0;
@@ -370,6 +414,8 @@ static void rk_on_packet(const uint8_t* buf, uint16_t n, uint32_t arrive) {
   rkLastSeq   = h.seq;
   rkLastPktMs = millis();
   rkLastPktUs = arrive;
+  { uint8_t sr = SREG; cli(); rkWdLastPktUs = arrive; SREG = sr; }
+  if (h.flags & RKEY_KF_ACTIVE) rkActiveMs = millis();
   rkEchoTSend = h.tSend;
   rkWpm       = (h.wpm < 5) ? 5 : (h.wpm > 60 ? 60 : h.wpm);
   rkReqDelayMs = (h.delayMs >= 10 && h.delayMs <= 1000) ? h.delayMs : 0;
@@ -431,6 +477,8 @@ static void rk_service() {
   uint32_t downSince = rkDownSinceUs, lastUp = rkLastUpUs;
   SREG = sr;
 
+  if (rkWdTripped) { rkWdTripped = false; rk_abort_internal(F("isr watchdog")); rkMuted = true; return; }
+
   if (!rk_allowed()) {
     if (pend || qbusy || outDown || rkPtt) { rk_abort_internal(F("not allowed")); rkMuted = true; }
     rkPendH = rkPendT;                           // drop anything that slipped in
@@ -469,6 +517,55 @@ static void rk_service() {
   }
 }
 
+// ---------------- LCD trace ----------------
+#define RK_TR 16                               // = LCD row
+static char     rkTr[RK_TR];
+static uint8_t  rkTrN = 0;
+static uint32_t rkTrDownUs = 0, rkTrUpUs = 0;
+static bool     rkTrIsDown = false;
+
+static void rk_tr_put(char c) {
+  if (rkTrN == RK_TR) { memmove(rkTr, rkTr + 1, RK_TR - 1); rkTrN--; }
+  rkTr[rkTrN++] = c;
+}
+
+static void rk_trace_service() {
+  while (true) {
+    uint8_t sr = SREG; cli();
+    if (rkPlTail == rkPlHead) { SREG = sr; return; }
+    uint32_t at = rkPl[rkPlTail].at; uint8_t s = rkPl[rkPlTail].s;
+    rkPlTail = (rkPlTail + 1) & (RK_PL - 1);
+    SREG = sr;
+    uint32_t dit = 1200000UL / rkWpm;
+    if (s == 1) {
+      if (rkTrN) {
+        uint32_t gap = at - rkTrUpUs;
+        if (gap >= 5 * dit)      { rk_tr_put(' '); rk_tr_put('/'); rk_tr_put(' '); }
+        else if (gap >= 2 * dit) rk_tr_put(' ');
+      }
+      rkTrDownUs = at; rkTrIsDown = true;
+    } else {
+      if (rkTrIsDown) rk_tr_put(s == 2 ? '*' : ((at - rkTrDownUs) < 2 * dit ? '.' : '-'));
+      rkTrUpUs = at; rkTrIsDown = false;
+    }
+  }
+}
+
+// 0 = off (disabled / no key), 1 = DISC, 2 = CONN (our client's packets arrive)
+uint8_t rkey_link_state() {
+  if (!RkeyEnable || !RkeyKeySet) return 0;
+  bool conn = rkUdpUp && rkHaveSession && !rkNonceBad && (millis() - rkLastPktMs) < 1000;
+  return conn ? 2 : 1;
+}
+
+// Last 16 trace chars, right-aligned (newest at the right edge), NUL-terminated.
+void rkey_trace16(char out[17]) {
+  uint8_t pad = RK_TR - rkTrN;
+  memset(out, ' ', pad);
+  memcpy(out + pad, rkTr, rkTrN);
+  out[RK_TR] = 0;
+}
+
 // ---------------- public API ----------------
 bool rkey_ptt_wanted() { return rkPtt; }
 
@@ -480,9 +577,18 @@ bool rkey_busy() {
   return b;
 }
 
+// Remote keying now or within the last 5 s: callers defer blocking work
+// (Ethernet.maintain() DHCP renew) until the operator pauses.
+bool rkey_keying_recent() {
+  if (rkey_busy()) return true;
+  return rkHaveSession && rkActiveMs != 0 && (millis() - rkActiveMs) < 5000UL;
+}
+
 void rkey_abort() { rk_abort_internal(F("ext")); rkMuted = true; }
 
 void rkey_setup() {
+  rkWdLinkUs    = (uint32_t)RkeyLinkTimeoutMs * 1000UL;   // cfg is read before rkey_setup()
+  rkWdMaxDownUs = (uint32_t)RkeyMaxDownMs * 1000UL;
   rkPort1 = portOutputRegister(digitalPinToPort(CW1)); rkMask1 = digitalPinToBitMask(CW1);
   rkPort2 = portOutputRegister(digitalPinToPort(CW2)); rkMask2 = digitalPinToBitMask(CW2);
   // Timer1: normal mode, clk/64 -> 4 µs per tick, compare A used as one-shot alarm
@@ -519,14 +625,18 @@ void rkey_loop() {
     rk_on_packet(buf, (uint16_t)n, arrive);
   }
   rk_service();
+  rk_trace_service();
 }
 
 #else  // !FEATURE_NET — PCB without Ethernet
 bool rkey_cfg(const String&, const String&) { return false; }
 bool rkey_ptt_wanted() { return false; }
 bool rkey_busy()       { return false; }
+bool rkey_keying_recent() { return false; }
 void rkey_abort()      {}
 void rkey_setup()      {}
 void rkey_loop()       {}
+uint8_t rkey_link_state() { return 0; }
+void rkey_trace16(char out[17]) { memset(out, ' ', 16); out[16] = 0; }
 #endif
 // =================== END REMOTE CW KEY ===================

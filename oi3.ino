@@ -498,7 +498,10 @@ void ethernet_loop() {
     Serial.println(F("Eth: link lost"));
   }
 
-  if (EthLinkStatus && EthernetDHCP) {
+  // maintain() blocks during a DHCP renew (up to the 60 s begin() timeout if
+  // the server does not answer) -> never while a remote CW stream is keying;
+  // the renew runs in the next pause (lease T1 leaves hours of margin).
+  if (EthLinkStatus && EthernetDHCP && !rkey_keying_recent()) {
     Ethernet.maintain();
   }
 }
@@ -1283,6 +1286,9 @@ static uint8_t       keyerLcdTxCol      = 0;
 // Set by LCD RUNTIME during a WPM-change overlay so transient chars don't
 // overwrite the "WPM 28" notification on row 1.
 static bool          keyerRow1Locked    = false;
+// True while the LCD menu item "IPkey" is selected: row 1 shows the remote
+// CW key trace (rkey_trace16) instead of the keyer TX echo.
+static bool          rkeyRow1           = false;
 
 // --- TrxNet /s-cw drop-box (filled by onSetCw callback, drained in loop) ---
 static char          trxPendingCW[KEYER_SENDBUF_SIZE];
@@ -1310,7 +1316,7 @@ void onSetCw(const char* /*from*/, const uint8_t* data, size_t len) {
 // Called after each element/char has actually been transmitted, so the LCD
 // is a truthful log of what went on the air.
 static void keyer_lcd_putc(char c) {
-  if (keyerRow1Locked) return;   // LCD overlay owns row 1 briefly
+  if (keyerRow1Locked || rkeyRow1) return;   // LCD overlay / Rkey trace owns row 1
   // Space at end of row gets eaten — no wrap on whitespace
   if (c == ' ' && keyerLcdTxCol >= 16) return;
   if (keyerLcdTxCol >= 16) {
@@ -2207,7 +2213,8 @@ void lptune_net_loop() {
 // (see KEYER block) — saved by lcd_edit_save().
 #include <EEPROM.h>
 
-const uint8_t LCD_MENU_ITEM_COUNT = 25;
+const uint8_t LCD_MENU_ITEM_COUNT = 26;
+const uint8_t LCD_RKEY_ITEM       = 25;   // remote CW key: CONN/DISC + trace on row 1
 const uint8_t LCD_VALUE_WIDTH     = 12;
 const uint8_t LCD_MODE_WIDTH      = 3;
 const uint8_t LCD_SEP_COL         = 12;
@@ -2439,6 +2446,16 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
       break;
     case 24:  // PTT output enable (not persisted — always on after reboot)
       snprintf(raw, sizeof(raw), "PTTout%c%s", s, PttOutputEnable ? "on" : "off");
+      break;
+    case 25:  // remote CW key link (read-only); row 1 shows the played trace
+#ifdef FEATURE_NET
+      {
+        uint8_t st = rkey_link_state();
+        strcpy(raw, st == 2 ? "IPkey CONN" : st == 1 ? "IPkey DISC" : "IPkey off");
+      }
+#else
+      strcpy(raw, "no net");
+#endif
       break;
     default:
       strcpy(raw, "?");
@@ -2708,6 +2725,28 @@ static void lcd_pin_menu() {
   EEPROM.update(LCD_EEPROM_IDX_ADDR, lcdMenuIdx);
 }
 
+// Row 1 while the "IPkey" item is selected: the remote CW trace, redrawn when
+// it changes. Overlays (WPM, TUNE) keep priority; on leaving the item row 1
+// is cleared and handed back to the keyer echo.
+static char lcdRkeyLast[17] = "";
+static void lcd_rkey_row1() {
+  bool own = (lcdMenuIdx == LCD_RKEY_ITEM);
+  if (own != rkeyRow1) {
+    rkeyRow1 = own;
+    lcdRkeyLast[0] = 0;
+    if (!keyerRow1Locked) { lcd.setCursor(0, 1); lcd.print(F("                ")); }
+    keyerLcdTxCol = 0;
+  }
+  if (!own) return;
+  if (keyerRow1Locked) { lcdRkeyLast[0] = 0; return; }   // redraw after the overlay
+  char t[17];
+  rkey_trace16(t);
+  if (strcmp(t, lcdRkeyLast) == 0) return;
+  lcd.setCursor(0, 1);
+  lcd.print(t);
+  strcpy(lcdRkeyLast, t);
+}
+
 void lcd_loop() {
   if (millis() - lcdLastTickMs < LCD_TICK_MS) return;
   lcdLastTickMs = millis();
@@ -2842,6 +2881,7 @@ void lcd_loop() {
     lcd_pin_menu();
   }
 
+  lcd_rkey_row1();
   lcd_render(false);
 }
 // =================== END LCD RUNTIME ===================

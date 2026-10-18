@@ -42,8 +42,11 @@ int main(int argc,char**argv){
       if(!black && (rand()/(double)RAND_MAX)>=loss) net.push_back({now+lat+jit*(rand()/(double)RAND_MAX), b});
     }
     // deliver
-    for(size_t i=0;i<net.size();){ if(net[i].arrive<=now){ rk_on_packet(net[i].b.data(),net[i].b.size(),(uint32_t)g_now_us); net.erase(net.begin()+i);} else i++; }
-    if(g_now_us%1000==0){ rk_service();
+    // FZ/FL: main loop frozen (e.g. a blocking DHCP renew): no packet intake,
+    // no rk_service(); only the Timer1 ISR runs
+    double fz=getenv("FZ")?atof(getenv("FZ")):0, fl=getenv("FL")?atof(getenv("FL")):0; bool frozen=(now>=fz&&now<fz+fl);
+    for(size_t i=0;i<net.size() && !frozen;){ if(net[i].arrive<=now){ rk_on_packet(net[i].b.data(),net[i].b.size(),(uint32_t)g_now_us); net.erase(net.begin()+i);} else i++; }
+    if(g_now_us%1000==0 && !frozen){ rk_service(); rk_trace_service();
       // sequencer model: up after 20 ms, down after 200 ms tail
       static double upReq=-1, dnReq=-1; bool w=rkey_ptt_wanted();
       if(w){ dnReq=-1; if(SequencerLevel==0){ if(upReq<0)upReq=now; if(now-upReq>=20000){SequencerLevel=PttOut;upReq=-1;} } }
@@ -56,7 +59,7 @@ int main(int argc,char**argv){
     prevTc=tc;
     bool cur=(g_port&0x0C)==0x0C; if(cur!=prev){ out.push_back({now,cur}); prev=cur; }
   }
-  { double mx=0; for(size_t i=0;i+1<out.size();i++) if(out[i].second) mx=std::max(mx,out[i+1].first-out[i].first); printf("longest output key-down = %.1f ms, out edges=%zu, muted=%d\n",mx/1000,out.size(),rkMuted); if(getenv("BO")) { for(auto&o:out) if(o.first>atof(getenv("BO"))-200000 && o.first<atof(getenv("BO"))+atof(getenv("BL"))+1500000) printf("  out %.1f ms %s\n",o.first/1000,o.second?"DOWN":"up"); } }
+  { double mx=0; for(size_t i=0;i+1<out.size();i++) if(out[i].second) mx=std::max(mx,out[i+1].first-out[i].first); printf("longest output key-down = %.1f ms, out edges=%zu, muted=%d\n",mx/1000,out.size(),rkMuted); if(getenv("BO")) { for(auto&o:out) if(o.first>atof(getenv("BO"))-200000 && o.first<atof(getenv("BO"))+atof(getenv("BL"))+1500000) printf("  out %.1f ms %s\n",o.first/1000,o.second?"DOWN":"up"); } if(getenv("FZ")) { double z=atof(getenv("FZ")); for(size_t i=0;i+1<out.size();i++) if(out[i].second && out[i].first<z+atof(getenv("FL")) && out[i+1].first>z) printf("  key-down across the freeze: %.1f ms (from %.1f ms)\n",(out[i+1].first-out[i].first)/1000,out[i].first/1000); } }
   // compare
   printf("in edges=%zu out edges=%zu late=%u lost=%u D=%u ms\n",E.size(),out.size(),rkLateEv,rkLostEv,(unsigned)(rk_D_us()/1000));
   size_t n=std::min(E.size(),out.size()); double maxMarkErr=0,maxGapErr=0,lmin=1e18,lmax=0;
@@ -64,5 +67,6 @@ int main(int argc,char**argv){
     double l=out[i].first-E[i].t; lmin=std::min(lmin,l); lmax=std::max(lmax,l);
     if(i+1<n){ double din=(E[i+1].t-E[i].t)*(1+ppm*1e-6), dout=out[i+1].first-out[i].first; double err=fabs(dout-din);
       if(E[i].down){ if(err>2000) printf("mark %zu in=%.0f out=%.0f t=%.0f\n",i,din,dout,E[i].t); maxMarkErr=std::max(maxMarkErr,err);} else maxGapErr=std::max(maxGapErr,err);} }
+  { char tr[17]; rkey_trace16(tr); printf("LCD trace        = '%s' (%s)\n", tr, rkey_link_state()==2?"CONN":"DISC"); }
   printf("mark len max err = %.0f us (dit=%.0f us)\ngap  len max err = %.0f us\nlatency min/max  = %.1f / %.1f ms\n",maxMarkErr,dit,maxGapErr,lmin/1000,lmax/1000);
 }

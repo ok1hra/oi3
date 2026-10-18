@@ -46,8 +46,18 @@ Keying happens only in CW/CWR, without interlock and without a low-power tune in
 progress. While a remote stream is active the local paddle is sidetone-only and
 `/s-cw` text waits.
 
-Paddle2IP can generate a key (web page → *Generate new key*) and shows it once
+Paddle2IP can generate a key (web page → *Generate new key*) and shows it
 as a ready `[RkeyKey=...]` line for `oi3.cfg`.
+
+## LCD
+
+Menu item 25 (`IPkey`) shows the link on row 0 (`IPkey CONN` = a client session
+is sending, `IPkey DISC`, `IPkey off` = disabled / no key) and, while selected,
+the trace of the elements actually played on CW1/CW2 on row 1, newest on the
+right: `.` / `-` by mark length (< 2 dits at the sender's WPM = dot), space =
+letter gap (≥ 2 dits), ` / ` = word gap (≥ 5 dits), `*` = mark cut by an
+abort. The Timer1 ISR logs each played edge into an 8-entry ring;
+`rkey_loop()` builds the trace, so the ISR stays short.
 
 ## Behaviour
 
@@ -64,7 +74,15 @@ as a ready `[RkeyKey=...]` line for `oi3.cfg`.
   PTT is held for 7 dits (sender WPM) after the last key-up, then the sequencer
   applies `PTTtail`.
 * **Safety**: link timeout, max key-down, edge gap beyond redundancy, stale
-  packets, interlock, mode change → key up immediately and **mute**. The stream
+  packets, interlock, mode change → key up immediately and **mute**. Link
+  timeout and max key-down are also enforced in the Timer1 ISR (checked every
+  50 ms while the key is down, and a mark never starts on a link that is
+  already timed out), so a blocked `loop()` cannot leave the transmitter keyed.
+* **Blocking work**: `Ethernet.maintain()` (DHCP renew, can block up to the
+  60 s timeout when the DHCP server does not answer) is skipped while remote
+  keying is active or was within the last 5 s; the renew runs in the next
+  pause. A static IP (`EthernetDHCP=0`) avoids it completely and is
+  recommended for a remote rig. The stream
   resumes only at the next word boundary (sender key-up older than 5 dits) or
   when the sender is idle, so a partial character is never transmitted.
 * **Security**: SipHash-2-4 tag with the shared key on every packet. A new
@@ -106,6 +124,7 @@ cd test/rkey_sim
 g++ -O1 -std=gnu++17 -w -I. -I../.. -include mock.h sim.cpp -o sim
 ./sim <ppm> <latency_us> <jitter_us> <loss> <wpm> <seed>
 BO=<blackout_start_us> BL=<blackout_len_us> ./sim 0 30000 10000 0 30 7
+FZ=<freeze_start_us> FL=<freeze_len_us> ./sim 0 30000 10000 0 30 7   # loop() blocked, only the ISR runs
 ```
 
 Results (text "CQ CQ TEST 5NN K CQ TEST R", 102 edges):
@@ -116,7 +135,8 @@ Results (text "CQ CQ TEST 5NN K CQ TEST R", 102 edges):
 | +0.5 % drift, 30 ms + 0–40 ms jitter, 10 % loss, 30 WPM | 25 µs | 1.5 ms | 150–160 ms |
 | −0.5 % drift, 25 % loss | 25 µs | 1.5 ms | 142–147 ms |
 | 0–200 ms jitter (> D) | 25 µs | 7.5 ms, 2 late edges | D adapts 120 → 177 ms |
-| 2 s blackout mid-mark | mark cut after 267 ms | — | resumes at next word |
+| 2 s blackout mid-mark | mark cut 300 ms after the last packet | — | resumes at next word |
+| `loop()` blocked 5 s mid-mark | key released by the ISR ≤ 300 ms after the last packet (was 4.9 s without the ISR watchdog) | — | resumes at next word |
 
 (25 µs is the simulation step, not the firmware resolution.)
 
