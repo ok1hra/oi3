@@ -210,6 +210,7 @@ static uint16_t rkReqDelayMs = 0;
 
 // pending edges (accepted, waiting for TX ready)
 static uint32_t rkPend[RK_Q];
+static uint32_t rkPendArr[RK_Q];                 // arrival micros() per pending edge (late diagnostics)
 static uint8_t  rkPendH = 0, rkPendT = 0;
 
 // timing
@@ -329,15 +330,29 @@ static void rk_send_status(bool force) {
 }
 
 // ---------------- edge intake ----------------
-static void rk_pend_push(uint32_t e) {
+static void rk_pend_push(uint32_t e, uint32_t arrive) {
   uint8_t nh = (rkPendH + 1) & (RK_Q - 1);
   if (nh == rkPendT) { rk_abort_internal(F("pend full")); rkMuted = true; return; }
   rkPend[rkPendH] = e;
+  rkPendArr[rkPendH] = arrive;
   rkPendH = nh;
 }
 
 // Hand one edge to the ISR queue with its absolute play time.
-static void rk_schedule_edge(uint32_t e) {
+// serialDebug: where a late edge lost its time. lead = D - net - wait:
+// net  = arrival behind the fastest path (network jitter + sender delay),
+// wait = arrival -> scheduling (sequencer not ready / slow main loop).
+static void rk_late_debug(bool down, int32_t lead, uint32_t t, uint32_t arrive, uint32_t now) {
+  if (!serialDebug) return;
+  Serial.print(F("[RKEY late ")); Serial.print(down ? F("down") : F("up"));
+  Serial.print(F(" lead=")); Serial.print(lead / 1000L);
+  Serial.print(F(" D=")); Serial.print(rk_D_us() / 1000UL);
+  Serial.print(F(" net=")); Serial.print((int32_t)(arrive - t - (uint32_t)rk_skew_min()) / 1000L);
+  Serial.print(F(" wait=")); Serial.print((int32_t)(now - arrive) / 1000L);
+  Serial.println(F("ms]"));
+}
+
+static void rk_schedule_edge(uint32_t e, uint32_t arrive) {
   bool down = RKEY_EV_DOWN(e);
   uint32_t t = RKEY_EV_TIME(e);
   uint32_t now = micros();
@@ -372,9 +387,11 @@ static void rk_schedule_edge(uint32_t e) {
     rkExtraUs += sh + 2000UL;
     if (rkExtraUs > RK_EXTRA_MAX_US) rkExtraUs = RK_EXTRA_MAX_US;
     rkLateEv++;
+    rk_late_debug(true, lead, t, arrive, now);
   } else if (!down && lead < 0) {
     at = now;                                    // late key-up: release now
     rkLateEv++;
+    rk_late_debug(false, lead, t, arrive, now);
   }
   if ((int32_t)(at - rkLastAt) < 0) at = rkLastAt;   // keep queue monotonic
   rkLastAt = at;
@@ -464,7 +481,7 @@ static void rk_on_packet(const uint8_t* buf, uint16_t n, uint32_t arrive) {
     bool down = RKEY_EV_DOWN(e);
     if (down == rkLastState) continue;           // ignore non-transition
     rkLastState = down;
-    rk_pend_push(e);
+    rk_pend_push(e, arrive);
   }
 }
 
@@ -498,7 +515,7 @@ static void rk_service() {
     if (rk_tx_ready()) {
       rkWaitSinceMs = 0;
       while (rkPendT != rkPendH) {
-        rk_schedule_edge(rkPend[rkPendT]);
+        rk_schedule_edge(rkPend[rkPendT], rkPendArr[rkPendT]);
         rkPendT = (rkPendT + 1) & (RK_Q - 1);
       }
     } else if (rkWaitSinceMs && (millis() - rkWaitSinceMs) > RK_READY_TIMEOUT_MS) {
