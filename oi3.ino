@@ -1,5 +1,5 @@
 
-const char* REV = "20260925";
+const char* REV = "20261018";
 
 // $ ./build.sh
 // git commit -am "...
