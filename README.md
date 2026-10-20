@@ -88,6 +88,8 @@ HHHHHHHHHHHH|MMM
   current menu item (see [Menu items](#menu-items)).
 - **Separator** (1 char) — encodes the menu FSM state:
   - `|` PINNED — value is displayed; DWN/UP edit live WPM.
+  - `:` PINNED, and a Paddle2IP remote key is connected (`IPkey CONN`)
+    with the rig in CW/CW-R — ready to be keyed remotely.
   - `<` BROWSING — DWN/UP step through menu items.
   - `=` EDITING — DWN/UP change the value of the current item.
 - **Mode field** (3 chars) — current CI-V mode, **uppercase** when CI-V

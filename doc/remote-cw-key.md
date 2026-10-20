@@ -59,6 +59,9 @@ letter gap (≥ 2 dits), ` / ` = word gap (≥ 5 dits), `*` = mark cut by an
 abort. The Timer1 ISR logs each played edge into an 8-entry ring;
 `rkey_loop()` builds the trace, so the ISR stays short.
 
+In the PINNED state the separator before the mode field shows `:` instead of
+`|` while a client is connected (`IPkey CONN`) and the rig is in CW/CW-R.
+
 ## Behaviour
 
 * **Timing**: `playAt = t_sender + min_latency + D`. `min_latency` is the

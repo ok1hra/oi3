@@ -1,5 +1,5 @@
 
-const char* REV = "20261018";
+const char* REV = "20261020";
 
 // $ ./build.sh
 // git commit -am "...
@@ -2500,7 +2500,9 @@ static void lcd_render(bool force) {
   switch (lcdState) {
     case LCD_BROWSING: sep = '<'; break;
     case LCD_EDITING:  sep = '='; break;
-    default:           sep = '|'; break;
+    default:           // PINNED; ':' = Paddle2IP connected and rig in CW/CW-R
+      sep = (rkey_link_state() == 2 && (CivMode == 0x03 || CivMode == 0x07)) ? ':' : '|';
+      break;
   }
 
   lcd_format_value(lcdMenuIdx, value, lcdState);
