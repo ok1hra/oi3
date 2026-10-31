@@ -565,6 +565,7 @@ and discovers peers on the LAN.
 | `/hz`   | `uint32_t` Hz            | On every CivFreq change  |
 | `/mode` | `uint8_t` CIV mode byte  | On every CivMode change  |
 | `/lptune` | `uint8_t` state        | Low-power TUNE state: `0` idle (restored), `1` carrier up, `2` refused, `3` aborted |
+| `/ptt`  | `uint8_t` `1` / `0`      | To the `/s-ptt` holder only: `1` keyed, `0` released or refused |
 
 **Topics subscribed by OI3 (peers can drive us):**
 
@@ -575,6 +576,7 @@ and discovers peers on the LAN.
 | `/s-cw`   | ASCII bytes      | Enqueue for CW or RTTY send (see Keyer). |
 | `/s-cw`   | `0x03` or `0xFF` | Abort current CW/RTTY send and flush buffer. |
 | `/s-lptune` | `uint8_t` `1` / `2` / `0` / `3` | Low-power TUNE: `1` start, `2` keepalive, `0` stop, `3` query state (see below). |
+| `/s-ptt`  | `uint8_t` `1` / `0` | Remote PTT lease: `1` key / renew (every ≤ 500 ms), `0` release (see below). |
 
 When a new peer joins, OI3 sends it a CON snapshot of its current
 `/hz`, `/mode` and `/lptune` — but only after CI-V is known (i.e. either the rig
@@ -595,6 +597,18 @@ runs, `/s-hz` and `/s-mode` are held and applied after the restore, and `/s-cw`
 text is dropped rather than sent after the carrier. The `/lptune` greeting — or
 the answer to `/s-lptune 3`, for a peer that restarted and so got no greeting —
 is how a peer learns this firmware supports it.
+
+**Remote PTT over TrxNet:** `/s-ptt 1` keys the sequencer for a peer that
+sends the audio itself — local-trx in wifilt, with JS8 or WSPR audio from a PC
+sound card while this keyer holds the radio's PTT. It is a lease: the peer
+repeats `1` every 300 ms and PTT drops 1.5 s after the last one, so a peer
+that crashed or lost the network cannot leave the rig keyed; `0` releases at
+once. The first peer to key holds it until release, others are ignored. It is
+refused — `/ptt 0` — while anything else transmits (a CW send, a tune,
+Paddle2IP, the interlock) or with PTT output off (menu item 24); `/ptt 1`
+confirms. A tune is refused while a peer holds the lease. Since FW 20261031,
+TrxNet 1.08 (it tells two peers on one PC apart by port). See TrxNet
+INTEGRATION.md §7.3.
 
 Menu item 7 shows the live peer count. Long-press SET in BROWSING on
 item 7 enters a special "browse" mode where DWN/UP walk the peer list

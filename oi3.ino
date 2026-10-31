@@ -1,5 +1,5 @@
 
-const char* REV = "20261020";
+const char* REV = "20261031";
 
 // $ ./build.sh
 // git commit -am "...
@@ -903,6 +903,47 @@ void lptune_publish(uint8_t st) {
   net.publish("/lptune", &st, 1);
 }
 
+// /s-ptt lease (TrxNet INTEGRATION.md 7.3): remote PTT for audio modes -- a
+// peer (local-trx) keying this rig for JS8/WSPR while the audio comes from a
+// PC sound card. The holder renews "1" every <= 500 ms; none for
+// TRX_PTT_LEASE_MS and PTT drops by itself, so a crashed peer or a pulled
+// cable cannot leave the rig keyed. One more PTT source for the sequencer,
+// ORed in by ptt_inputs_poll(). Started or refused by netptt_service().
+#define TRX_PTT_LEASE_MS 1500UL
+char                   trxPttHolder[TRXNET_MAX_DEVICE_NAME] = {0};   // "" = free
+volatile bool          trxPttWant    = false;
+volatile unsigned long trxPttRenewMs = 0;
+bool                   trxPttKeyed   = false;   // the lease output
+
+static void onSetPtt(const char* from, const uint8_t* data, size_t len) {
+  if (len < 1 || !from || !from[0]) return;
+  bool held = trxPttHolder[0] != '\0';
+  if (held && strcmp(trxPttHolder, from) != 0) return;   // another peer holds it
+  if (data[0] == 1) {
+    if (!held) {
+      strncpy(trxPttHolder, from, TRXNET_MAX_DEVICE_NAME - 1);
+      trxPttHolder[TRXNET_MAX_DEVICE_NAME - 1] = '\0';
+    }
+    trxPttRenewMs = millis();
+    trxPttWant = true;
+  } else {
+    trxPttWant = false;
+  }
+}
+
+// /ptt answer to the holder: 1 keyed, 0 released or refused.
+void netptt_publish(uint8_t st) {
+  if (!trxNetStarted || trxPttHolder[0] == '\0') return;
+  net.publishTo(trxPttHolder, "/ptt", &st, 1, TRX_NON);
+}
+
+// The PTT source. The lease is checked here rather than in netptt_service(),
+// so it also lapses inside the blocking keyer/tune loops -- they all pump
+// ptt_loop(), which polls this.
+bool netptt_wanted() {
+  return trxPttKeyed && trxPttWant && (millis() - trxPttRenewMs) <= TRX_PTT_LEASE_MS;
+}
+
 void onPeerJoined(const TrxPeer* peer) {
   if (!peer) return;
   if (trxPendingGreetCount >= TRXNET_MAX_PEERS) return;
@@ -944,6 +985,7 @@ void trxnet_loop() {
       net.subscribe("/s-mode", onSetMode);
       net.subscribe("/s-cw",   onSetCw);
       net.subscribe("/s-lptune", onSetLpTune);
+      net.subscribe("/s-ptt",  onSetPtt);
 #if TRXNET_VERSION >= 0x0104
       for (uint8_t i = 0; i < prioCount; i++) prioPtr[i] = prioPrefix[i];
       net.setPriorityPrefixes(prioCount ? prioPtr : nullptr, prioCount);
@@ -978,6 +1020,7 @@ void trxnet_loop()      {}
 void civ_publish_freq() {}
 void civ_publish_mode() {}
 void lptune_publish(uint8_t) {}
+bool netptt_wanted()    { return false; }
 #endif // FEATURE_NET
 // =================== END TRXNET ===================
 
@@ -1147,7 +1190,7 @@ static void ptt_inputs_poll() {
   // / SEQ output. CW/FSK keying is unaffected (the keyer bypasses the gate below).
   ptt_request(PttOutputEnable
               && (footSwTx || ptt232Tx || ilInTx || keyerPttRequest || tunePttRequest
-                  || rkey_ptt_wanted()));
+                  || rkey_ptt_wanted() || netptt_wanted()));
 }
 
 void ptt_setup() {
@@ -2003,6 +2046,7 @@ static bool tune_tx_idle() {
   if (SequencerLevel != 0 || PttActive) return false;   // sequencer must be down
   if (keyerState != KEYER_IDLE)         return false;   // keyer not mid-send
   if (keyerPttRequest || tunePttRequest)return false;
+  if (netptt_wanted())                  return false;   // a peer holds the /s-ptt lease
   if (ptt_interlock_active)             return false;
   if (digitalRead(FootSW) == LOW)       return false;   // external PTT (footsw)
   if (digitalRead(PTT232) == HIGH)      return false;   // external PTT (232)
@@ -2902,9 +2946,51 @@ void setup() {
   lcd_runtime_init();
 }
 
+// ===================== NET PTT (/s-ptt) =====================
+// Starts, refuses and ends the /s-ptt lease declared in the TRXNET block. Lives
+// here, after the KEYER and TUNE blocks, because "is anything else transmitting"
+// needs their state. Same TX-idle rule as tune_tx_idle(): the lease never takes
+// over a CW send, a tune, Paddle2IP or an interlock.
+#ifdef FEATURE_NET
+void netptt_service() {
+  if (trxPttKeyed) {
+    if (!netptt_wanted() || ptt_interlock_active) {   // released, lapsed, or interlock
+      trxPttKeyed = false;
+      trxPttWant = false;
+      netptt_publish(0);
+      trxPttHolder[0] = '\0';
+      if (serialDebug) Serial.println(F("[NETPTT off]"));
+    }
+    return;
+  }
+  if (!trxPttWant) { trxPttHolder[0] = '\0'; return; }
+  if ((millis() - trxPttRenewMs) > TRX_PTT_LEASE_MS) {   // went stale before we got to it
+    trxPttWant = false;
+    trxPttHolder[0] = '\0';
+    return;
+  }
+  bool idle = PttOutputEnable && !ptt_interlock_active && !tuneActive
+              && keyerState == KEYER_IDLE && !keyerPttRequest && !tunePttRequest
+              && !rkey_busy();
+  if (idle) {
+    trxPttKeyed = true;
+    netptt_publish(1);
+    if (serialDebug) { Serial.print(F("[NETPTT on ")); Serial.print(trxPttHolder); Serial.println(']'); }
+  } else {
+    trxPttWant = false;
+    netptt_publish(0);              // refused -- the holder reports it
+    trxPttHolder[0] = '\0';
+  }
+}
+#else
+void netptt_service() {}
+#endif
+// =================== END NET PTT ===================
+
 void loop() {
   ethernet_loop();
   trxnet_loop();
+  netptt_service();
   rkey_loop();
   lptune_net_loop();
   civ_loop();
