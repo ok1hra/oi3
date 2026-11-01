@@ -27,6 +27,7 @@ means.
 - [Menu items](#menu-items)
 - [CI-V (Icom CAT)](#ci-v-icom-cat)
   - [CW over CI-V (CIV_CW_VIA_CIV)](#cw-over-ci-v-civ_cw_via_civ)
+- [Kenwood CAT (TS-480)](#kenwood-cat-ts-480)
 - [PTT, sequencer and interlock](#ptt-sequencer-and-interlock)
   - [Outputs](#outputs)
   - [Mode → output mapping](#mode--output-mapping)
@@ -230,7 +231,7 @@ row 1 while it is selected.
 | 2  | IP high       | `192.168.`           | no       | — / `no link`                   | First two octets of the assigned IP. |
 | 3  | IP low        | `1.220`              | no       | — / `no link`                   | Last two octets. Items 2+3 together = full IP. |
 | 4  | Baud (CAT)    | `baud 9600`          | no       | — (from cfg)                    | Serial2 baudrate used for CI-V. |
-| 5  | CI-V addr     | `CI-V 0x98`          | no       | — (from cfg)                    | Configured radio address (0x98=IC-7610, 0x56=IC-746). |
+| 5  | CI-V addr     | `CI-V 0x98` / `KENWOOD` | no    | — (from cfg)                    | Configured radio address (0x98=IC-7610, 0x56=IC-746); `KENWOOD` with `BAND_DECODER_IN=2`. |
 | 6  | Frequency     | `14.074.0 kHz`       | no       | — / `---.---.- kHz`             | Live rig frequency, 100 Hz resolution. Placeholder while `!CivValid`. |
 | 7  | Peers         | `Peers 2` / `Peers off` | browse | EDITING = walk peer list       | Number of remote TrxNet peers, EDITING cycles through them showing `name .lastIP`. Priority peers (on `PriorityPrefixes`) show `*` instead of the `.` in the name (`705*01`). `off` = NET_ID=0 / no Eth. |
 | 8  | Interlock     | `Inter 1`            | yes (not persisted) | 0 ↔ 1                | `1` = D2 is PA safety interlock; `0` = D2 is external PTT-in. See [PTT, sequencer and interlock](#ptt-sequencer-and-interlock). |
@@ -240,7 +241,7 @@ row 1 while it is selected.
 | 12 | PTT tail      | `PTTL 210ms`         | yes (not persisted) | 0..9990 ms step 10   | Delay after TX-off before PTT1/2/3 LOW. |
 | 13 | PA tail       | `PAL 0ms`            | yes (not persisted) | 0..9990 ms step 10   | Delay from PTT1/2/3 LOW to PTTPA LOW. |
 | 14 | SEQ tail      | `SeqL 0ms`           | yes (not persisted) | 0..9990 ms step 10   | Delay from PTTPA LOW to SEQUENCER LOW. |
-| 15 | PTT output    | `PTT1` / `TX PTT3` / `PTT D` | yes (not persisted) | 1, 2, 3 | Effective PTT pin for the **current CI-V mode**. `D`=default (no mapping / CI-V silent), `TX `=sequencer active. Edit changes the per-mode slot in RAM; `oi3.cfg` repopulates after reset. The right edge of the value field also shows a live input-debug triplet `FIP` — see [Input-debug overlay](#input-debug-overlay). |
+| 15 | PTT output    | `PTT1` / `TX PTT3` / `PTT D3` | yes (not persisted) | 1, 2, 3 | Effective PTT pin for the **current CI-V mode**. `D3`=default output 3 is used (no mapping / CI-V silent), `TX `=sequencer active. Edit changes the per-mode slot in RAM (CI-V silent: `PTTmodeDefault`); `oi3.cfg` repopulates after reset. While editing, holding MODE keys the selected output for test — see [PTT output test](#ptt-output-test). The right edge of the value field also shows a live input-debug triplet `FIP` — see [Input-debug overlay](#input-debug-overlay). |
 | 16 | WPM           | `WPM 28`             | yes      | 5..50 step 1                    | Keyer speed. Also editable via DWN/UP in PINNED. |
 | 17 | Iambic mode   | `Mode B`             | yes      | A ↔ B                           | Iambic A or B. |
 | 18 | Paddle        | `Pad N` / `Pad R`    | yes      | Normal ↔ Reverse                | Swap dit/dah paddle assignment. |
@@ -307,6 +308,53 @@ standby, or wired to a different cable.
 
 ---
 
+## Kenwood CAT (TS-480)
+
+`BAND_DECODER_IN=2` replaces the CI-V backend with the Kenwood PC-command
+protocol (ASCII, `;`-terminated) on the same Serial2 / `SERBAUD2`
+(`CIV_ADRESS` is ignored). Code: `kenwood.ino`. Set the rig's COM speed
+(menu 56) to the same rate as the logger and `SERBAUD2`; at 4800 bps the
+port runs with 2 stop bits as the TS-480 requires.
+
+**Shared line with a PC / logger.** OI3 RX listens to the rig's TXD, so it
+sees every answer the rig gives to the logger. OI3 TX is merged into the
+rig's RXD together with the PC's TX (the merge itself is a hardware
+matter — diode-OR / gate, not done by the firmware). Therefore OI3 is a
+passive sniffer first:
+
+- Every `IF`, `FA`/`FB` (only the current RX VFO), `FR` and `MD` answer on
+  the line updates frequency / mode, whoever asked for it — logger poll,
+  AI auto-information or OI3 itself.
+- Only when no frequency/mode data came for **2 s** *and* the line has been
+  silent for **100 ms** (not in the middle of a logger transaction) does
+  OI3 send `IF;` itself, at most once per 2 s. A logger that polls
+  `IF`/`FA`/`MD` keeps OI3 completely silent on the line.
+- In split, while transmitting, the `IF` frequency (= TX VFO) is ignored so
+  `/hz` does not bounce between the VFOs on every over.
+- Same 10 s watchdog as CI-V (`CivValid`), same uppercase/lowercase LCD
+  mode cell and MODE-button behaviour.
+
+Modes are translated to the CI-V codes used everywhere else (PTT mapping
+`PTTmode*`, keyer, TrxNet `/mode`):
+
+| TS-480 `MD` | 1 LSB | 2 USB | 3 CW | 4 FM | 5 AM | 6 FSK | 7 CW-R | 9 FSK-R |
+|-------------|-------|-------|------|------|------|-------|--------|---------|
+| CI-V        | 0x00  | 0x01  | 0x03 | 0x05 | 0x02 | 0x04  | 0x07   | 0x08    |
+
+TrxNet `/s-hz` → `FA…;` (or `FB…;` on VFO B, nothing in memory mode),
+`/s-mode` → `MD…;`, each followed by `IF;` so the change comes back through
+the sniffer and is re-published. Sets wait (max 150 ms) for a quiet gap.
+
+**Low-power TUNE** (MODE button / `/s-lptune`) uses the rig's own
+`TX2;` (TX Tune transmission — reduced-power carrier): no mode or power
+change, `TunePower` / `TuneRestoreFallback` / `TuneSettleMs` are unused. The
+sequencer brings up only SEQ + PA (PTT1/2/3 stay down — the rig keys
+itself), `TX2;` follows after `PAlead`, and at the end `RX;` is sent and
+confirmed via `IF` (one retry; a low 400 ms tone warns if the rig never
+confirmed RX). LCD row 1 shows `TUNE CAT`.
+
+---
+
 ## PTT, sequencer and interlock
 
 ### Outputs
@@ -337,6 +385,19 @@ audio so a stray cough on the headset doesn't end up on the air. The
 mapping is set in `oi3.cfg` once; menu item 15 shows the *effective*
 PTT for the current mode and lets you change the slot on the fly (RAM
 only — it goes back to cfg on reset).
+
+### PTT output test
+
+In menu item 15 EDITING (long-press SET, value shows `PTT=n`), UP/DWN
+selects the output and **holding MODE keys it** for as long as the button
+is held — the MODE button neither rotates the mode nor starts TUNE there.
+The test is one more sequencer source, so it runs the normal sequence
+(SEQ → PA → selected PTT1/2/3 with the configured lead/tail delays) and
+the value shows `TX PTT=n` while the sequencer is up. It is refused (low
+beep) with PTT output off (item 24) or with the interlock asserted; the
+output cannot be changed while the test is held, and leaving EDITING
+with SET drops it. Serial debug prints `[PTT TEST on/off]` plus the
+usual `[PTT…]` sequence.
 
 ### Sequencer timing
 
@@ -687,7 +748,7 @@ Configuration keys (from `readSDSettings()`):
 | `PTTmodeCWR`          | `3`         | 1 / 2 / 3               | CIV 0x07 → PTT slot. |
 | `PTTmodeRTR`          | `1`         | 1 / 2 / 3               | CIV 0x08 → PTT slot. |
 | `PTTmodeDefault`      | `3`         | 1 / 2 / 3               | Fallback when CIV silent / mode unknown. |
-| `BAND_DECODER_IN`     | `1`         | 0 / 1                   | 0 = disable CI-V loop; 1 = ICOM CI-V. |
+| `BAND_DECODER_IN`     | `1`         | 0 / 1 / 2               | 0 = no CAT; 1 = ICOM CI-V; 2 = Kenwood TS-480 (see [Kenwood CAT](#kenwood-cat-ts-480)). Other values → 0. |
 | `SERBAUD2`            | `9600`      | bps                     | Serial2 baudrate (rig CAT). |
 | `CIV_ADRESS`          | `98` (hex)  | hex byte                | `56`=IC-746, `98`=IC-7610, etc. |
 | `CIV_CW_VIA_CIV`      | `0`         | 0 / 1                   | **Reserved / not implemented** — parsed but ignored; CW is always keyed locally via CW1/CW2 + sequencer. |

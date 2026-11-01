@@ -197,7 +197,7 @@ byte          PTTmodeFM       = 3;
 byte          PTTmodeCWR      = 3;
 byte          PTTmodeRTR      = 1;
 byte          PTTmodeDefault  = 3;
-int           BAND_DECODER_IN = 1;
+int           BAND_DECODER_IN = 1;      // 0=off, 1=ICOM CI-V, 2=KENWOOD (TS-480)
 unsigned long SERBAUD2        = 9600;
 byte          CIV_ADRESS      = 0x98;   // hex
 bool          CIV_CW_VIA_CIV  = false;  // RESERVED - parsed but unused; CW is always keyed locally
@@ -269,7 +269,8 @@ void readSDSettings() {
       else if (settingName == "PTTmodeCWR")      PTTmodeCWR = (byte)settingValue.toInt();
       else if (settingName == "PTTmodeRTR")      PTTmodeRTR = (byte)settingValue.toInt();
       else if (settingName == "PTTmodeDefault")  PTTmodeDefault = (byte)settingValue.toInt();
-      else if (settingName == "BAND_DECODER_IN") BAND_DECODER_IN = settingValue.toInt();
+      else if (settingName == "BAND_DECODER_IN") { int v = settingValue.toInt();
+                                                   BAND_DECODER_IN = (v >= 0 && v <= 2) ? v : 0; }
       else if (settingName == "SERBAUD2")        SERBAUD2 = (unsigned long)settingValue.toInt();
       else if (settingName == "CIV_ADRESS")      { unsigned char b[3]; settingValue.toCharArray((char*)b, 3);
                                                    CIV_ADRESS = hexToDecBy4bit(b[0])<<4 | hexToDecBy4bit(b[1]); }
@@ -528,6 +529,8 @@ const unsigned long CIV_POLL_INTERVAL_SLOW  = 2000;
 const unsigned long CIV_POLL_INTERVAL_FAST  = 200;
 const unsigned long CIV_WATCHDOG_MS         = 10000;
 
+// Rig state in CI-V encoding regardless of the CAT protocol: the KENWOOD
+// backend (kenwood.ino) translates into these same variables.
 unsigned long CivFreq  = 0;       // Hz, last parsed frequency
 // Boot default = CW (0x03). When CI-V is silent (!CivValid) the MODE button
 // rotates this locally; once rig data arrives, broadcasts overwrite it.
@@ -742,6 +745,12 @@ void civ_request_fast_poll(unsigned long duration_ms) {
 }
 
 void civ_setup() {
+  if (BAND_DECODER_IN == 2) {
+    // TS-480: 4800 bps runs with 2 stop bits, other speeds with 1
+    Serial2.begin(SERBAUD2, SERBAUD2 == 4800 ? SERIAL_8N2 : SERIAL_8N1);
+    kw_setup();
+    return;
+  }
   Serial.println(F("--- ICOM CI-V ---"));
   Serial2.begin(SERBAUD2);
   // first poll fires immediately on first civ_loop() tick
@@ -811,6 +820,26 @@ void civ_loop() {
   }
 }
 // =================== END ICOM CI-V ===================
+
+
+// ===================== RIG CAT DISPATCH =====================
+// One entry point per CAT action, routed by BAND_DECODER_IN to the ICOM CI-V
+// backend above or the KENWOOD backend (kenwood.ino). 0 = no CAT at all.
+void cat_loop() {
+  if      (BAND_DECODER_IN == 1) civ_loop();
+  else if (BAND_DECODER_IN == 2) kw_loop();
+}
+
+void cat_send_setfreq(uint32_t hz) {
+  if      (BAND_DECODER_IN == 1) civ_send_setfreq(hz);
+  else if (BAND_DECODER_IN == 2) kw_send_setfreq(hz);
+}
+
+void cat_send_setmode(uint8_t civmode) {
+  if      (BAND_DECODER_IN == 1) civ_send_setmode(civmode);
+  else if (BAND_DECODER_IN == 2) kw_send_setmode(civmode);
+}
+// =================== END RIG CAT DISPATCH ===================
 
 
 // ===================== TRXNET =====================
@@ -999,11 +1028,11 @@ void trxnet_loop() {
 
   if (trxSHzPending && !tuneActive) {
     trxSHzPending = false;
-    civ_send_setfreq(trxPendingHz);
+    cat_send_setfreq(trxPendingHz);
   }
   if (trxSModePending && !tuneActive) {
     trxSModePending = false;
-    civ_send_setmode(trxPendingMode);
+    cat_send_setmode(trxPendingMode);
   }
 
   // Drain greeting queue — one peer per iteration. Gated until CIV state is
@@ -1056,6 +1085,13 @@ bool          keyerPttRequest      = false;
 // on the air. ORed into ptt_inputs_poll() like keyerPttRequest so the level poll
 // cannot drop PTT under the tune. Written only by the LOW-POWER TUNE section.
 bool          tunePttRequest       = false;
+// PTT-output test source — held true by the LCD while MODE is pressed in item
+// 15 EDITING. Runs the normal sequencer (SEQ -> PA -> selected PTT1/2/3), so
+// interlock, PttOutputEnable and timings apply. Written only by lcd_loop().
+bool          pttTestRequest       = false;
+// KENWOOD TUNE: the rig keys itself via CAT "TX2;", so the sequencer stops at
+// level 4 (SEQ + PA up, PTT123 skipped) exactly like pttExternal.
+bool          tuneCatPtt           = false;
 byte          PttOut               = 3;        // current selected PTT output 1/2/3
 unsigned long LastSeqChange        = 0;
 // Global PTT-output enable. false = the sequencer asserts NO output (PTT123 / PA /
@@ -1123,8 +1159,8 @@ static void ptt_sequencer_step() {
         if (serialDebug) Serial.println(F("[PTT SEQ-L]"));
       }
       break;
-    case 4:  // PA up — wait PAlead then PTT123 up (skipped if pttExternal); or on release wait PAtail then PA down
-      if (PttActive && !pttExternal && (now - LastSeqChange) >= (unsigned long)PAlead) {
+    case 4:  // PA up — wait PAlead then PTT123 up (skipped if pttExternal / tuneCatPtt); or on release wait PAtail then PA down
+      if (PttActive && !pttExternal && !tuneCatPtt && (now - LastSeqChange) >= (unsigned long)PAlead) {
         digitalWrite(PTT_PINS[PttOut], HIGH);
         LastSeqChange = now;
         SequencerLevel = PttOut;
@@ -1190,7 +1226,7 @@ static void ptt_inputs_poll() {
   // / SEQ output. CW/FSK keying is unaffected (the keyer bypasses the gate below).
   ptt_request(PttOutputEnable
               && (footSwTx || ptt232Tx || ilInTx || keyerPttRequest || tunePttRequest
-                  || rkey_ptt_wanted() || netptt_wanted()));
+                  || pttTestRequest || rkey_ptt_wanted() || netptt_wanted()));
 }
 
 void ptt_setup() {
@@ -1590,7 +1626,7 @@ static void keyer_wait_us_pump(unsigned long us) {
     ethernet_loop();
     trxnet_loop();
     rkey_loop();
-    civ_loop();
+    cat_loop();
     ptt_loop();
     keyer_check_paddles_cmos(elapsed, us);
     if (trxCwAbort) break;
@@ -1625,7 +1661,7 @@ static bool keyer_begin_tx_wait_sequencer() {
     ethernet_loop();
     trxnet_loop();
     rkey_loop();
-    civ_loop();
+    cat_loop();
     ptt_loop();
     if (trxCwAbort)             { keyerPttRequest = false; return false; }
     if ((millis() - t0) > 2000) { keyerPttRequest = false; return false; }  // safety
@@ -2033,6 +2069,12 @@ void keyer_loop() {
 // peer that crashed or lost the network cannot leave the rig keyed until
 // TuneMaxMs. State goes out on /lptune: 1 carrier up, 3 aborted, 0 restored
 // (idle), 2 refused because something else is transmitting.
+//
+// KENWOOD (BAND_DECODER_IN == 2): the TS-480 has its own low-power carrier,
+// CAT "TX2;" (TX Tune transmission). Steps 1-4 and 8 are skipped (no power or
+// mode change, TunePower unused), the sequencer only brings up SEQ + PA
+// (tuneCatPtt, PTT123 stays down - the rig keys itself), PAlead later "TX2;"
+// replaces CW1/CW2, and step 7 sends "RX;" and confirms RX via IF.
 static const uint8_t  TUNE_CW_MODE     = 0x03;   // CI-V mode byte for CW carrier
 // Tune source. Plain uint8_t, not an enum: the .ino prototype generator puts
 // function prototypes above any type declared here.
@@ -2045,7 +2087,7 @@ static bool tune_tx_idle() {
   if (!PttOutputEnable)                 return false;   // PTT output disabled (LCD item 24)
   if (SequencerLevel != 0 || PttActive) return false;   // sequencer must be down
   if (keyerState != KEYER_IDLE)         return false;   // keyer not mid-send
-  if (keyerPttRequest || tunePttRequest)return false;
+  if (keyerPttRequest || tunePttRequest || pttTestRequest) return false;
   if (netptt_wanted())                  return false;   // a peer holds the /s-ptt lease
   if (ptt_interlock_active)             return false;
   if (digitalRead(FootSW) == LOW)       return false;   // external PTT (footsw)
@@ -2057,20 +2099,24 @@ static bool tune_tx_idle() {
 // Request PTT and pump until the sequencer has brought up PTT123 (+PTTlead
 // settle). Returns false on interlock / timeout. Keeps CivValid fresh.
 // Caller must have set CivMode so ptt_output_for_civmode() picks the wanted relay.
+// With tuneCatPtt the target is level 4 (SEQ + PA) + PAlead, then the caller
+// keys the rig over CAT.
 static bool tune_wait_ptt_up() {
   tunePttRequest = true;              // ORed in by ptt_inputs_poll → sequencer up
   ptt_request(true);                  // set PttActive/PttOut now (mirrors keyer)
+  byte          target = tuneCatPtt ? 4 : PttOut;
+  unsigned long lead   = tuneCatPtt ? (unsigned long)PAlead : (unsigned long)PTTlead;
   unsigned long t0 = millis();
-  while (SequencerLevel != PttOut) {
+  while (SequencerLevel != target) {
     ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop();
     civLastParseMs = millis();
     if (ptt_interlock_active)    return false;
     if ((millis() - t0) > 2000)  return false;   // safety
   }
   unsigned long tl = millis();
-  while ((millis() - tl) < (unsigned long)PTTlead) {
+  while ((millis() - tl) < lead) {
     ptt_loop();
-    if (ptt_interlock_active || SequencerLevel != PttOut) return false;
+    if (ptt_interlock_active || SequencerLevel != target) return false;
   }
   return true;
 }
@@ -2089,7 +2135,8 @@ static void tune_wait_ptt_down() {
 
 static void tune_lcd_show(uint8_t src) {
   char buf[17];
-  snprintf(buf, sizeof(buf), src == TUNE_SRC_NET ? "TUNE %u%% NET" : "TUNE %u%%", TunePower);
+  if (BAND_DECODER_IN == 2) strcpy(buf, src == TUNE_SRC_NET ? "TUNE CAT NET" : "TUNE CAT");
+  else snprintf(buf, sizeof(buf), src == TUNE_SRC_NET ? "TUNE %u%% NET" : "TUNE %u%%", TunePower);
   keyerRow1Locked = true;
   lcd.setCursor(0, 1);
   lcd.print(F("                "));
@@ -2097,65 +2144,78 @@ static void tune_lcd_show(uint8_t src) {
   lcd.print(buf);
 }
 
+// Step 6: hold the carrier. Button: min TuneHoldMs, then until MODE released.
+// NET: until /s-lptune 0, while keepalives keep arriving. Both capped at
+// TuneMaxMs. Returns true when aborted (interlock, keepalive lost, cap).
+static bool tune_hold(uint8_t src) {
+  unsigned long tStart = millis();
+  for (;;) {
+    ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop();
+    civLastParseMs = millis();
+    if (ptt_interlock_active) return true;                     // abort on interlock
+    unsigned long elapsed = millis() - tStart;
+    if (src == TUNE_SRC_NET) {
+      if (trxLpTuneStop) return false;                         // peer says done
+      if ((millis() - trxLpTuneKaMs) > (unsigned long)TuneKeepaliveMs) {
+        tone(TONE, 200, 200);                                  // peer went silent
+        return true;
+      }
+    } else {
+      bool held = (digitalRead(MENU) == LOW);
+      if (!held && elapsed >= (unsigned long)TuneHoldMs) return false; // released after min hold
+    }
+    if (elapsed >= (unsigned long)TuneMaxMs) {                // stuck-button / peer safety cap
+      tone(TONE, 200, 200);
+      return true;
+    }
+  }
+}
+
 // Full blocking tune action. Precondition: tune_tx_idle() && CivValid.
 static void tune_run(uint8_t src) {
   tuneActive = true;                      // holds /s-hz, /s-mode back until the restore
-  // --- 1) read + save current power / mode ---
-  uint8_t savedRaw;
-  bool haveSaved = civ_read_power_blocking(&savedRaw, TuneReadTimeoutMs, 2);
-  if (!haveSaved) {
-    savedRaw = civ_power_pct_to_raw(TuneRestoreFallback);  // fallback restore target
-    tone(TONE, 300, 120); delay(140); tone(TONE, 300, 120); delay(140);  // warble
-  }
+  bool    cat         = (BAND_DECODER_IN == 2);   // KENWOOD: rig's own TX Tune over CAT
+  uint8_t savedRaw    = 0;
   uint8_t savedMode   = CivMode;
   uint8_t savedFilter = CivFilter;        // preserve IF filter (FIL1/2/3) across the tune
 
-  // --- 2) force CW mode (FIL1 during tune is irrelevant; restored at the end) ---
-  civ_send_setmode(TUNE_CW_MODE);
-  CivMode = TUNE_CW_MODE;                 // cache → sequencer picks CW PTT relay
+  if (!cat) {
+    // --- 1) read + save current power (mode/filter saved above) ---
+    bool haveSaved = civ_read_power_blocking(&savedRaw, TuneReadTimeoutMs, 2);
+    if (!haveSaved) {
+      savedRaw = civ_power_pct_to_raw(TuneRestoreFallback);  // fallback restore target
+      tone(TONE, 300, 120); delay(140); tone(TONE, 300, 120); delay(140);  // warble
+    }
 
-  // --- 3) set low power ---
-  civ_send_set_power(civ_power_pct_to_raw(TunePower));
+    // --- 2) force CW mode (FIL1 during tune is irrelevant; restored at the end) ---
+    civ_send_setmode(TUNE_CW_MODE);
+    CivMode = TUNE_CW_MODE;               // cache → sequencer picks CW PTT relay
 
-  // --- 4) settle, then LCD feedback ---
-  unsigned long ts = millis();
-  while ((millis() - ts) < (unsigned long)TuneSettleMs) { ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop(); }
+    // --- 3) set low power ---
+    civ_send_set_power(civ_power_pct_to_raw(TunePower));
+
+    // --- 4) settle ---
+    unsigned long ts = millis();
+    while ((millis() - ts) < (unsigned long)TuneSettleMs) { ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop(); }
+  }
   tune_lcd_show(src);
 
   // --- 5) PTT up, then solid carrier ---
   bool keyed = false;
   bool aborted = false;
+  tuneCatPtt = cat;                       // KENWOOD: sequencer stops at SEQ + PA
   if (tune_wait_ptt_up()) {
     keyed = true;
-    digitalWrite(CW1, HIGH);              // solid carrier (rig provides its own sidetone)
-    digitalWrite(CW2, HIGH);
+    if (cat) {
+      kw_tx_tune(true);                   // "TX2;" - rig's reduced-power carrier
+    } else {
+      digitalWrite(CW1, HIGH);            // solid carrier (rig provides its own sidetone)
+      digitalWrite(CW2, HIGH);
+    }
     lptune_publish(1);
 
-    // --- 6) hold: min TuneHoldMs, then until MODE released; hard cap TuneMaxMs ---
-    //     NET: until /s-lptune 0, while keepalives keep arriving; same cap.
-    unsigned long tStart = millis();
-    for (;;) {
-      ethernet_loop(); trxnet_loop(); rkey_loop(); ptt_loop();
-      civLastParseMs = millis();
-      if (ptt_interlock_active) { aborted = true; break; }   // abort on interlock
-      unsigned long elapsed = millis() - tStart;
-      if (src == TUNE_SRC_NET) {
-        if (trxLpTuneStop) break;                                  // peer says done
-        if ((millis() - trxLpTuneKaMs) > (unsigned long)TuneKeepaliveMs) {
-          tone(TONE, 200, 200);                                    // peer went silent
-          aborted = true;
-          break;
-        }
-      } else {
-        bool held = (digitalRead(MENU) == LOW);
-        if (!held && elapsed >= (unsigned long)TuneHoldMs) break; // released after min hold
-      }
-      if (elapsed >= (unsigned long)TuneMaxMs) {                  // stuck-button / peer safety cap
-        tone(TONE, 200, 200);
-        aborted = true;
-        break;
-      }
-    }
+    // --- 6) hold ---
+    aborted = tune_hold(src);
   } else {
     aborted = true;                        // interlock or sequencer timeout
   }
@@ -2163,16 +2223,26 @@ static void tune_run(uint8_t src) {
 
   // --- 7) carrier off, PTT down ---
   if (keyed) {
-    digitalWrite(CW1, LOW);
-    digitalWrite(CW2, LOW);
+    if (cat) {
+      if (!kw_tx_tune(false)) {           // rig did not confirm RX - warn loudly
+        tone(TONE, 200, 400);
+        Serial.println(F("[TUNE] KENWOOD did not confirm RX;"));
+      }
+    } else {
+      digitalWrite(CW1, LOW);
+      digitalWrite(CW2, LOW);
+    }
   }
   tune_wait_ptt_down();
+  tuneCatPtt = false;
 
   // --- 8) restore power then mode+filter (best-effort, always runs) ---
-  civ_send_set_power(savedRaw);
-  civ_send_setmode_flt(savedMode, savedFilter);
-  CivMode   = savedMode;
-  CivFilter = savedFilter;
+  if (!cat) {
+    civ_send_set_power(savedRaw);
+    civ_send_setmode_flt(savedMode, savedFilter);
+    CivMode   = savedMode;
+    CivFilter = savedFilter;
+  }
   civLastParseMs = millis();              // don't let the watchdog fire post-tune
   tone(TONE, 600, 60);                    // restore-confirm blip
 
@@ -2379,8 +2449,9 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
     case 4:  // baud
       snprintf(raw, sizeof(raw), "baud %lu", SERBAUD2);
       break;
-    case 5:  // CI-V addr
-      snprintf(raw, sizeof(raw), "CI-V 0x%02X", CIV_ADRESS);
+    case 5:  // CI-V addr (KENWOOD has none)
+      if (BAND_DECODER_IN == 2) strcpy(raw, "KENWOOD");
+      else snprintf(raw, sizeof(raw), "CI-V 0x%02X", CIV_ADRESS);
       break;
     case 6:  // freq: MM.MMM.D kHz (HF) or MMM.MMM.D kHz (VHF), 100 Hz resolution
       if (!CivValid || CivFreq == 0) { strcpy(raw, "---.---.- kHz"); break; }
@@ -2443,18 +2514,19 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
     case 14:  // SEQUENCERtail: after PA LOW before SEQ LOW
       snprintf(raw, sizeof(raw), "SeqL%c%dms", s, SEQUENCERtail);
       break;
-    case 15:  // PTT output: BROWSING/PINNED = effective (1/2/3 or D, "TX " when active);
-             // EDITING = raw target value (always 1/2/3 after normalization)
+    case 15:  // PTT output: BROWSING/PINNED = effective (1/2/3, or D + default
+             // number, "TX " when active); EDITING = raw target value (always
+             // 1/2/3 after normalization), "TX " while the MODE test keys it
       if (state == LCD_EDITING) {
         byte v = (CivValid && CivMode < 16) ? PttOutByCivMode[CivMode] : PTTmodeDefault;
-        snprintf(raw, sizeof(raw), "PTT=%u", v);
+        snprintf(raw, sizeof(raw), "%sPTT=%u", (SequencerLevel != 0) ? "TX " : "", v);
       } else {
         byte n = ptt_output_for_civmode();
         bool isDefault = (!CivValid || CivMode == 0xFF || CivMode >= 16
                           || PttOutByCivMode[CivMode] < 1
                           || PttOutByCivMode[CivMode] > 3);
         const char* prefix = (SequencerLevel != 0) ? "TX " : "";
-        if (isDefault) snprintf(raw, sizeof(raw), "%sPTT%cD", prefix, s);
+        if (isDefault) snprintf(raw, sizeof(raw), "%sPTT%cD%u", prefix, s, n);
         else           snprintf(raw, sizeof(raw), "%sPTT%c%u", prefix, s, n);
       }
       break;
@@ -2653,6 +2725,7 @@ static void lcd_edit_step(int delta) {
       lcd_edit_ms_value(&SEQUENCERtail, delta);
       break;
     case 15: {  // PTT output 1↔2↔3 wrap (target = current mode slot, else default)
+      if (pttTestRequest) break;   // output is latched while the MODE test keys it
       byte* target = (CivValid && CivMode < 16) ? &PttOutByCivMode[CivMode] : &PTTmodeDefault;
       int v = (int)(*target);
       if (v < 1 || v > 3) v = PTTmodeDefault;
@@ -2888,13 +2961,26 @@ void lcd_loop() {
 
   lcdBtnPrev = btnNow;
 
-  // --- MODE button: !CivValid → cycle CivMode; CivValid → low-power TUNE ---
+  // --- MODE button: item 15 EDITING → PTT-output test (held = TX);
+  // otherwise !CivValid → cycle CivMode; CivValid → low-power TUNE ---
   // Sampled once per LCD tick (~30 ms), which also debounces the press edge.
   bool modeDownNow = (digitalRead(MENU) == LOW);
+  bool pttTestMenu = (lcdState == LCD_EDITING && lcdMenuIdx == 15);
+  if (pttTestRequest && (!modeDownNow || !pttTestMenu)) {
+    pttTestRequest = false;           // released, or SET left EDITING mid-test
+    if (serialDebug) Serial.println(F("[PTT TEST off]"));
+  }
   if (modeDownNow && !lcdModeDown) {
     lcdModeDown = true;
     if (lcdState == LCD_BROWSING) lcdBrowsingActivityMs = now;
-    if (!CivValid) {
+    if (pttTestMenu) {
+      if (PttOutputEnable && !ptt_interlock_active) {
+        pttTestRequest = true;        // ptt_loop() picks it up; release drops it
+        if (serialDebug) Serial.println(F("[PTT TEST on]"));
+      } else {
+        tone(TONE, 200, 120);         // refused: PTT output off or interlock
+      }
+    } else if (!CivValid) {
       civ_mode_cycle_next();          // rig silent → local mode rotation
     } else if (tune_tx_idle()) {
       tune_run(TUNE_SRC_BUTTON);      // rig active → exclusive blocking tune
@@ -2971,7 +3057,7 @@ void netptt_service() {
   }
   bool idle = PttOutputEnable && !ptt_interlock_active && !tuneActive
               && keyerState == KEYER_IDLE && !keyerPttRequest && !tunePttRequest
-              && !rkey_busy();
+              && !pttTestRequest && !rkey_busy();
   if (idle) {
     trxPttKeyed = true;
     netptt_publish(1);
@@ -2993,7 +3079,7 @@ void loop() {
   netptt_service();
   rkey_loop();
   lptune_net_loop();
-  civ_loop();
+  cat_loop();
   ptt_loop();
   keyer_loop();
   lcd_loop();
