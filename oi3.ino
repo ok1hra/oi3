@@ -1,5 +1,5 @@
 
-const char* REV = "20261031";
+const char* REV = "20261112";
 
 // $ ./build.sh
 // git commit -am "...
@@ -156,8 +156,11 @@ static bool serialDebug = false;
 
 LiquidCrystal lcd(lcd_rs, lcd_enable, lcd_d4, lcd_d5, lcd_d6, lcd_d7);
 
+void rpi_lcd_glyphs_init();   // rpi_status.ino: custom characters (CGRAM 1..5)
+
 void lcd_setup() {
   lcd.begin(LCD_COLUMNS, LCD_ROWS);
+  rpi_lcd_glyphs_init();
   String boot = String("FW ") + REV;
   byte col = (LCD_COLUMNS - boot.length()) / 2;
   lcd.setCursor(col, 0);
@@ -894,6 +897,7 @@ uint8_t  trxPendingGreetCount = 0;
 
 void onPeerJoined(const TrxPeer* peer);
 void onSetCw(const char* from, const uint8_t* data, size_t len);  // defined in KEYER block
+void onWlHost(const char* from, const uint8_t* data, size_t len); // rpi_status.ino
 
 void civ_publish_freq() {
   if (!trxNetStarted) return;
@@ -1015,6 +1019,7 @@ void trxnet_loop() {
       net.subscribe("/s-cw",   onSetCw);
       net.subscribe("/s-lptune", onSetLpTune);
       net.subscribe("/s-ptt",  onSetPtt);
+      net.subscribe("/wl-host", onWlHost);   // the Pi's state for the "RPI" menu item
 #if TRXNET_VERSION >= 0x0104
       for (uint8_t i = 0; i < prioCount; i++) prioPtr[i] = prioPrefix[i];
       net.setPriorityPrefixes(prioCount ? prioPtr : nullptr, prioCount);
@@ -1368,6 +1373,14 @@ static bool          keyerRow1Locked    = false;
 // True while the LCD menu item "IPkey" is selected: row 1 shows the remote
 // CW key trace (rkey_trace16) instead of the keyer TX echo.
 static bool          rkeyRow1           = false;
+// True while the LCD menu item "RPI" is selected: row 1 shows the Pi's state
+// (rpi_status.ino). Unlike IPkey, TX text still wins: the first character
+// sent takes row 1 over (rpiYield) and lcd_rpi_row1() hands it back
+// RPI_TX_HOLD_MS after the last one, with PTT down and nothing queued.
+static bool          rpiRow1            = false;
+static bool          rpiYield           = false;
+static unsigned long keyerLcdLastMs     = 0;
+const unsigned long  RPI_TX_HOLD_MS     = 2000;
 
 // --- TrxNet /s-cw drop-box (filled by onSetCw callback, drained in loop) ---
 static char          trxPendingCW[KEYER_SENDBUF_SIZE];
@@ -1396,6 +1409,14 @@ void onSetCw(const char* /*from*/, const uint8_t* data, size_t len) {
 // is a truthful log of what went on the air.
 static void keyer_lcd_putc(char c) {
   if (keyerRow1Locked || rkeyRow1) return;   // LCD overlay / Rkey trace owns row 1
+  if (rpiRow1 && !rpiYield) {
+    if (c == ' ') return;                    // a lone space is no reason to take over
+    lcd.setCursor(0, 1);                     // TX text replaces the Pi's state...
+    lcd.print(F("                "));
+    keyerLcdTxCol = 0;
+    rpiYield = true;                         // ...until lcd_rpi_row1() takes it back
+  }
+  keyerLcdLastMs = millis();
   // Space at end of row gets eaten — no wrap on whitespace
   if (c == ' ' && keyerLcdTxCol >= 16) return;
   if (keyerLcdTxCol >= 16) {
@@ -2311,6 +2332,11 @@ void lptune_net_loop() {
 // Menu item 24:      editable PTT-output enable (PTTout on/off). off = no PTT123 /
 //                    PA / SEQ from any source; CW/FSK keep keying. Not persisted —
 //                    always on after reboot (PttOutputEnable).
+// Menu item 25:      read-only IPkey link; row 1 shows the remote CW trace.
+// Menu item 26:      read-only "RPI": the state of the Raspberry Pi running WIFILT +
+//                    local-trx (TrxNet /wl-host, rpi_status.ino). Uses row 1 too,
+//                    but keyer TX text takes it over and returns it 2 s after TX.
+//                    Skipped while browsing until the Pi has been heard from.
 // Auto-repeat: 700 ms hold → 3 Hz. Active only in PINNED (WPM ±) and EDITING
 // (value dec/inc). BROWSING navigation is edge-only — one menu step per press.
 // Tones: only on BROWSING↔EDITING transition (low→high entering, high→low
@@ -2327,8 +2353,9 @@ void lptune_net_loop() {
 // (see KEYER block) — saved by lcd_edit_save().
 #include <EEPROM.h>
 
-const uint8_t LCD_MENU_ITEM_COUNT = 26;
+const uint8_t LCD_MENU_ITEM_COUNT = 27;
 const uint8_t LCD_RKEY_ITEM       = 25;   // remote CW key: CONN/DISC + trace on row 1
+const uint8_t LCD_RPI_ITEM        = 26;   // WIFILT Pi state, both rows (rpi_status.ino)
 const uint8_t LCD_VALUE_WIDTH     = 12;
 const uint8_t LCD_MODE_WIDTH      = 3;
 const uint8_t LCD_SEP_COL         = 12;
@@ -2409,6 +2436,10 @@ static bool lcd_peer_is_priority(const char* name) {
 // of a space — a visual hint that long-press SET enters EDITING. Read-only
 // items and PINNED state are unaffected. Item 15 in EDITING also switches its
 // rendering from "effective PTT with D/TX prefix" to the raw target value.
+void rpi_format_row0(char* out);   // rpi_status.ino
+void rpi_format_row1(char* out);
+extern bool rpiSeen;
+
 static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
   // Work buffer larger than LCD_VALUE_WIDTH so case 6 freq ("MMM.MMM.D kHz",
   // 13 chars) and "---.---.- kHz" placeholder fit; lcd_pad_left_align truncates
@@ -2569,6 +2600,13 @@ static void lcd_format_value(uint8_t idx, char* out, uint8_t state) {
         uint8_t st = rkey_link_state();
         strcpy(raw, st == 2 ? "IPkey CONN" : st == 1 ? "IPkey DISC" : "IPkey off");
       }
+#else
+      strcpy(raw, "no net");
+#endif
+      break;
+    case 26:  // RPI: WiFi / dBm / SSID / lock (read-only); row 1 in lcd_rpi_row1()
+#ifdef FEATURE_NET
+      rpi_format_row0(raw);
 #else
       strcpy(raw, "no net");
 #endif
@@ -2866,6 +2904,38 @@ static void lcd_rkey_row1() {
   strcpy(lcdRkeyLast, t);
 }
 
+// Row 1 while the "RPI" item is selected: the Pi's address or what it is doing.
+// Overlays (WPM, TUNE) keep priority; keyer TX text takes row 1 over (see
+// keyer_lcd_putc) and gets it back RPI_TX_HOLD_MS after the transmission.
+static char lcdRpiLast[17] = "";
+static void lcd_rpi_row1() {
+  bool own = (lcdMenuIdx == LCD_RPI_ITEM);
+  if (own != rpiRow1) {
+    rpiRow1 = own;
+    rpiYield = false;
+    lcdRpiLast[0] = 0;
+    if (!keyerRow1Locked) { lcd.setCursor(0, 1); lcd.print(F("                ")); }
+    keyerLcdTxCol = 0;
+  }
+  if (!own) return;
+  if (keyerRow1Locked) { lcdRpiLast[0] = 0; return; }   // redraw after the overlay
+  if (rpiYield) {
+    if (PttActive || keyerSendHead != keyerSendTail
+        || millis() - keyerLcdLastMs < RPI_TX_HOLD_MS) return;
+    rpiYield = false;
+    lcdRpiLast[0] = 0;
+    keyerLcdTxCol = 0;
+  }
+#ifdef FEATURE_NET
+  char t[17];
+  rpi_format_row1(t);
+  if (strcmp(t, lcdRpiLast) == 0) return;
+  lcd.setCursor(0, 1);
+  lcd.print(t);
+  strcpy(lcdRpiLast, t);
+#endif
+}
+
 void lcd_loop() {
   if (millis() - lcdLastTickMs < LCD_TICK_MS) return;
   lcdLastTickMs = millis();
@@ -2898,11 +2968,14 @@ void lcd_loop() {
   if (lcdState == LCD_BROWSING && dwnUpEdge) {
     // Edge-only menu navigation, one step per press
     lcdBrowsingActivityMs = now;
-    if (btnNow == 2) {
-      lcdMenuIdx = (lcdMenuIdx + LCD_MENU_ITEM_COUNT - 1) % LCD_MENU_ITEM_COUNT;
-    } else {
-      lcdMenuIdx = (lcdMenuIdx + 1) % LCD_MENU_ITEM_COUNT;
-    }
+    // The RPI item stays out of the way until a Pi has been heard from.
+    do {
+      if (btnNow == 2) {
+        lcdMenuIdx = (lcdMenuIdx + LCD_MENU_ITEM_COUNT - 1) % LCD_MENU_ITEM_COUNT;
+      } else {
+        lcdMenuIdx = (lcdMenuIdx + 1) % LCD_MENU_ITEM_COUNT;
+      }
+    } while (lcdMenuIdx == LCD_RPI_ITEM && !rpiSeen);
   } else if (lcdState == LCD_EDITING && (dwnUpEdge || dwnUpRepeat)) {
     lcd_edit_step(btnNow == 2 ? -1 : +1);
   } else if (lcdState == LCD_PINNED && (dwnUpEdge || dwnUpRepeat)) {
@@ -3014,6 +3087,7 @@ void lcd_loop() {
   }
 
   lcd_rkey_row1();
+  lcd_rpi_row1();
   lcd_render(false);
 }
 // =================== END LCD RUNTIME ===================

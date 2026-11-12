@@ -25,6 +25,7 @@ means.
 - [Menu navigation (FSM)](#menu-navigation-fsm)
   - [MODE button](#mode-button)
 - [Menu items](#menu-items)
+  - [RPI status](#rpi-status)
 - [CI-V (Icom CAT)](#ci-v-icom-cat)
   - [CW over CI-V (CIV_CW_VIA_CIV)](#cw-over-ci-v-civ_cw_via_civ)
 - [Kenwood CAT (TS-480)](#kenwood-cat-ts-480)
@@ -219,10 +220,11 @@ AFSK from the PC, etc.) without ever lying about the rig's real state.
 
 ## Menu items
 
-26 items, indexed 0..25. Items 0..6, 23 and 25 are read-only status; 7 is
+27 items, indexed 0..26. Items 0..6, 23, 25 and 26 are read-only status; 7 is
 browse-only (peer list); 8..22 and 24 are editable settings. The mode cell
-on the right of row 0 is the same on every item. Item 25 also takes over
-row 1 while it is selected.
+on the right of row 0 is the same on every item. Items 25 and 26 also take
+over row 1 while they are selected. Item 26 is skipped while browsing until
+a WIFILT Raspberry Pi has been heard from.
 
 | #  | Name          | Example display      | Editable | Range / values                  | Purpose |
 |----|---------------|----------------------|----------|---------------------------------|---------|
@@ -252,6 +254,50 @@ row 1 while it is selected.
 | 23 | UDP port      | `UDP 5683` / `no net` | no       | — (from cfg)                    | TrxNet UDP port (`UdpPort` in `oi3.cfg`). `no net` on boards without the network stack. |
 | 24 | PTT output    | `PTTout on` / `PTTout off` | yes (not persisted) | on ↔ off             | PTT outputs enabled; always on after reboot. |
 | 25 | Remote key    | `IPkey CONN` / `IPkey DISC` / `IPkey off` | no | —                      | Remote CW key server link: `CONN` = a Paddle2IP session is sending (packet < 1 s ago, valid nonce), `DISC` = no client, `off` = `RkeyEnable=0` or no `RkeyKey`. While selected, **row 1** shows the elements actually played on CW1/CW2, newest on the right: `.` / `-` by mark length at the sender's WPM, space = letter gap, ` / ` = word gap, `*` = mark cut by an abort (link loss, interlock, …). Example: `-.-. --.- / -.-`. The keyer TX echo is paused on row 1 meanwhile. See [doc/remote-cw-key.md](doc/remote-cw-key.md). |
+| 26 | RPI           | `▂-62 Domov 🔒` / `RPI wait` | no | —                                 | State of the Raspberry Pi running WIFILT + local-trx with this OI3 (TrxNet `/wl-host`). Uses **both rows** — see [RPI status](#rpi-status). |
+
+### RPI status
+
+Menu item 26 shows the state of a headless Raspberry Pi that runs WIFILT and
+local-trx with this OI3 as local-trx's CAT/CW/PTT, so its state can be read
+without a screen or a browser. WIFILT sends it over TrxNet (`/wl-host`, every
+5 s and on every change, see TrxNet INTEGRATION.md §7.4); the OI3 stores
+nothing.
+
+```
+ 0123456789AB | MMM
+ B-62 Domov L | USB    row 0: signal, dBm, SSID, lock
+ 192.168.1.23     H    row 1: the address to open in a browser, H = pulse
+```
+
+Row 0 (value field):
+
+- col 0: signal bars (three levels), the AP mast when the Pi runs its setup
+  hotspot, `?` when the data is more than 15 s old, blank when wired only;
+- cols 1..3: dBm of the WiFi link, `AP ` in hotspot mode, `ETH` wired only;
+- cols 5..10: the SSID (the hotspot's own name in AP mode), scrolling when
+  longer than six characters;
+- col 11: the lock. **Closed lock** (solid body, steady) = the Pi's file system
+  is locked (fslock). **Open lock** (lifted shackle, hollow body, **blinking**)
+  = fslock is installed but the system is unlocked. Blank = no fslock.
+
+Row 1: the IP address, with a heart in the last column for 0.3 s after each
+packet. When something is wrong it says so instead, with a running clock:
+
+| Row 1             | Meaning |
+|-------------------|---------|
+| `waiting for RPI` | nothing heard since this OI3 started |
+| `UPDATE 45%`      | a web update is running; `UPDATE  1:20` while the Pi is dark during it |
+| `RESTART   0:07`  | WIFILT is restarting itself (Save & Restart) |
+| `WIFILT STOP 0:12`| the WIFILT service was stopped |
+| `RPI REBOOT 0:45` | the Pi is rebooting or shutting down |
+| `RPI OFFLINE 3:05`| no packet for 15 s (3 min after a restart/reboot, 10 min during an update) |
+| `local-trx off` / `TRX not linked` | alternate with the address every 2 s: local-trx is gone from TrxNet / WIFILT's radio slot to local-trx is not connected |
+
+CW or RTTY text sent by the keyer still appears on row 1: the first
+character replaces the Pi's state, and the state comes back 2 s after the
+transmission ends (PTT down, nothing queued). WPM and TUNE overlays keep
+priority as on every other item.
 
 Items 16..21 are persisted to EEPROM on the EDITING→BROWSING transition.
 Items 7, 8..15 and 22 are intentionally **not** persisted — sequencer
@@ -638,6 +684,7 @@ and discovers peers on the LAN.
 | `/s-cw`   | `0x03` or `0xFF` | Abort current CW/RTTY send and flush buffer. |
 | `/s-lptune` | `uint8_t` `1` / `2` / `0` / `3` | Low-power TUNE: `1` start, `2` keepalive, `0` stop, `3` query state (see below). |
 | `/s-ptt`  | `uint8_t` `1` / `0` | Remote PTT lease: `1` key / renew (every ≤ 500 ms), `0` release (see below). |
+| `/wl-host` | 11 + n bytes    | State of the WIFILT Raspberry Pi for menu item 26 ([RPI status](#rpi-status); since FW 20261112). |
 
 When a new peer joins, OI3 sends it a CON snapshot of its current
 `/hz`, `/mode` and `/lptune` — but only after CI-V is known (i.e. either the rig
