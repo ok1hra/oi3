@@ -1,5 +1,5 @@
 
-const char* REV = "20261112";
+const char* REV = "20261113";
 
 // $ ./build.sh
 // git commit -am "...
@@ -363,8 +363,14 @@ void sdcfg_setup() {
 // ===================== ETHERNET =====================
 // HW: W5100/W5500 module on SPI, ETHINST (D46) pull-up — LOW = module present.
 // Boot: block up to ETH_BOOT_TIMEOUT waiting for link, show IP on LCD ~1 s.
-// Runtime: every ETH_CHECK_INTERVAL poll linkStatus(); on link-up reinit;
-// on DHCP refresh lease via Ethernet.maintain(). Runtime messages → Serial only.
+// Runtime: every ETH_CHECK_INTERVAL poll linkStatus(). A link that comes back
+// keeps the address it had (the W5x00 keeps it across a link drop); DHCP runs
+// again only while there is no address, every ETH_DHCP_RETRY_MS. Lease renewal
+// via Ethernet.maintain(), backed off after a failure. Every DHCP exchange is
+// capped at ETH_DHCP_TIMEOUT_MS: it blocks the whole loop (LCD, keyer, TrxNet),
+// and the library default of 60 s froze the OI3 for as long as a rebooting
+// WIFILT Pi -- often its DHCP server -- took to come back (2026-11-13).
+// Runtime messages → Serial only.
 // Link state is read by the LCD runtime even when the network stack is
 // compiled out (PCB_REV_3_141), so keep these two flags unconditionally
 // defined. They simply stay false when FEATURE_NET is undefined.
@@ -377,6 +383,14 @@ bool          EthModulePresent   = false;
 
 unsigned long EthLastCheckMs     = 0;
 const unsigned long ETH_CHECK_INTERVAL = 1000;
+const unsigned long ETH_DHCP_TIMEOUT_MS  = 3000;   // one whole DHCP exchange
+const unsigned long ETH_DHCP_REPLY_MS    = 1000;   // one server reply
+const unsigned long ETH_DHCP_RETRY_MS    = 15000;  // next try without an address
+// An address is in place (DHCP lease or static). After a failed begin() the
+// library's state would make every maintain() a new 3 s attempt, so without an
+// address the loop retries begin() on its own timer instead.
+static bool          ethHaveIp       = false;
+static unsigned long ethDhcpNextMs   = 0;
 const unsigned long ETH_BOOT_TIMEOUT   = 5000;
 const unsigned long ETH_SLIDE_MIN_MS   = 500;
 
@@ -387,8 +401,9 @@ IPAddress ethSubnet     (255, 255, 255, 0);
 IPAddress ethDns        (8, 8, 8, 8);
 
 static bool ethernet_bringUp() {
+  ethHaveIp = false;
   if (EthernetDHCP) {
-    if (Ethernet.begin(ethMac) == 0) return false;
+    if (Ethernet.begin(ethMac, ETH_DHCP_TIMEOUT_MS, ETH_DHCP_REPLY_MS) == 0) return false;
     IPAddress ip = Ethernet.localIP();
     if (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0) return false;
   } else {
@@ -396,8 +411,12 @@ static bool ethernet_bringUp() {
   }
   Ethernet.setRetransmissionTimeout(500);
   Ethernet.setRetransmissionCount(2);
+  ethHaveIp = true;
   return true;
 }
+
+// TrxNet starts only with an address (trxnet_loop).
+bool ethernet_has_ip() { return ethHaveIp; }
 
 static void ethernet_showIP() {
   IPAddress ip = Ethernet.localIP();
@@ -491,22 +510,37 @@ void ethernet_loop() {
   if (linkNow && !EthLinkStatus) {
     EthLinkStatus = true;
     Serial.println(F("Eth: link up"));
-    if (ethernet_bringUp()) {
-      Serial.print(F("Ethernet IP: "));
-      Serial.println(Ethernet.localIP());
-    } else {
-      Serial.println(F("Eth: DHCP fail on relink"));
-    }
+    // The address survives a link drop; asking DHCP again here meant waiting
+    // for a server that is usually the very machine that just rebooted.
+    if (!ethHaveIp) ethDhcpNextMs = millis();
   } else if (!linkNow && EthLinkStatus) {
     EthLinkStatus = false;
     Serial.println(F("Eth: link lost"));
   }
 
-  // maintain() blocks during a DHCP renew (up to the 60 s begin() timeout if
-  // the server does not answer) -> never while a remote CW stream is keying;
-  // the renew runs in the next pause (lease T1 leaves hours of margin).
-  if (EthLinkStatus && EthernetDHCP && !rkey_keying_recent()) {
-    Ethernet.maintain();
+  // DHCP blocks the loop for up to ETH_DHCP_TIMEOUT_MS -> never while a remote
+  // CW stream is keying; it runs in the next pause.
+  if (!EthLinkStatus || rkey_keying_recent()) return;
+  unsigned long now = millis();
+  if ((long)(now - ethDhcpNextMs) < 0) return;
+  if (!ethHaveIp) {
+    if (ethernet_bringUp()) {
+      Serial.print(F("Ethernet IP: "));
+      Serial.println(Ethernet.localIP());
+    } else {
+      Serial.println(F("Eth: DHCP fail, retry in 15 s"));
+      ethDhcpNextMs = now + ETH_DHCP_RETRY_MS;
+    }
+  } else if (EthernetDHCP) {
+    // A failed renew or rebind leaves the address on the chip but the library
+    // in a state where every call retries: back off instead.
+    // maintain()'s codes (Ethernet library Dhcp.h, not included by Ethernet.h):
+    // 1 = DHCP_CHECK_RENEW_FAIL, 3 = DHCP_CHECK_REBIND_FAIL.
+    int rc = Ethernet.maintain();
+    if (rc == 1 || rc == 3) {
+      Serial.println(F("Eth: DHCP renew fail, retry in 15 s"));
+      ethDhcpNextMs = now + ETH_DHCP_RETRY_MS;
+    }
   }
 }
 #else  // !FEATURE_NET — board has no Ethernet module (PCB_REV_3_141)
@@ -1008,7 +1042,7 @@ void trxnet_setup() {
 
 void trxnet_loop() {
   // Deferred init / re-probe on link-up
-  if (NET_ID != 0x00 && EthernetEnable && EthModulePresent && EthLinkStatus) {
+  if (NET_ID != 0x00 && EthernetEnable && EthModulePresent && EthLinkStatus && ethernet_has_ip()) {
     if (!trxNetStarted) {
       snprintf(trxDeviceName, sizeof(trxDeviceName), "OI3.%02x", NET_ID);
       net.setPort(UdpPort);

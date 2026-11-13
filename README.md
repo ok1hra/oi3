@@ -757,8 +757,14 @@ pin pulled low when a module is fitted. If absent the firmware logs
   `192.168.1.220 / .1 / 255.255.255.0 / 8.8.8.8`.
 - The MAC address is `DE:AD:BE:EF:FE:(0xFF - NET_ID)` — derived from
   NET_ID so multiple OI3s on the same LAN don't collide.
-- Link is monitored every 1 s; on link-up the firmware re-inits the
-  stack and TrxNet, so unplug/replug cycles recover automatically.
+- Link is monitored every 1 s. A link that comes back keeps the address
+  it had (unplug/replug, or the switch / Raspberry Pi on the other end
+  rebooting); DHCP runs again only while the unit has no address, then
+  every 15 s. Each DHCP exchange is capped at 3 s and lease renewals back
+  off for 15 s after a failure: DHCP blocks the whole firmware (LCD, keyer,
+  TrxNet), and the library's 60 s default froze the unit for as long as a
+  rebooting WIFILT Pi -- its DHCP server -- took to come back (since FW
+  20261113). TrxNet starts once there is an address.
 
 The boot LCD shows the assigned IP for ~1 s. After that, items 2 and 3
 of the menu hold the same information — pin item 2 (or 3) and you have
